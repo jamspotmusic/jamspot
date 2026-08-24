@@ -18,6 +18,7 @@
   },
   "include": [
     "app/page.tsx",
+    "app/test-concert-query/page.tsx",
     "components/ConcertModal.tsx",
     "components/StreamingServiceLinks.tsx",
     "tests/unit/**/*.ts"
