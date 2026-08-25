@@ -43,6 +43,7 @@ export function compiledJsFiles(dir) {
 export function coverageIncludes() {
   return [
     path.join(BUILD_DIR, "app", "page.js"),
+    path.join(BUILD_DIR, "app", "test-concert-query", "page.js"),
     path.join(BUILD_DIR, "components", "ConcertModal.js"),
     path.join(BUILD_DIR, "components", "StreamingServiceLinks.js"),
     ...compiledJsFiles(path.join(BUILD_DIR, "lib")),
