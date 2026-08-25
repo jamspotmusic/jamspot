@@ -22,7 +22,7 @@ export const DEFAULT_API_CACHE_TTL_SECONDS =
  * Configurable via TICKETMASTER_CACHE_TTL_SECONDS.
  */
 export const TICKETMASTER_CACHE_TTL_SECONDS =
-  Number(process.env.TICKETMASTER_CACHE_TTL_SECONDS) || 300;
+  Number(process.env.TICKETMASTER_CACHE_TTL_SECONDS) || 1800;
 
 /**
  * Normalizes a search value (artist name, keyword, etc.) so that requests
