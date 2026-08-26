@@ -254,6 +254,6 @@ test("searchConcerts opts the request into Next's Data Cache with the configured
   // Ticketmaster intentionally uses a shorter default (5 min) than the
   // artist-data integrations (24h) - concert listings go stale faster.
   assert.deepEqual((capturedInit as { next?: { revalidate?: number } })?.next, {
-    revalidate: 300,
+    revalidate: 1800,
   });
 });
