@@ -4,6 +4,27 @@ All notable changes to JamSpot are documented in this file.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-25
+
+### Added
+
+- Unconditional geolocation in the `concert-query` Edge Function whenever a query names no place. The model now reports only the location the user actually said out loud; leaving those fields null is how it asks for the caller to be located. "Radiohead tickets" searches near the caller just as "chill concert under $60" does - naming an artist is not naming a place.
+- Resolution of the caller's location in the Edge Function rather than the model, in descending order of trust: device coordinates the caller sends in `location`, then a city/state/ZIP the caller already had, then the edge network's approximate geo headers (Vercel- and Cloudflare-style). When none of those can locate the caller the function returns a 422 with `code: "location_required"` so the client can ask for permission and retry, instead of picking a city on the user's behalf.
+- A `geolocationDenied` request flag for clients that asked the device for a location and didn't get one - permission refused, geolocation unsupported, or timed out. The Edge Function then widens to a nationwide search (`locationSource: "nationwide"`) rather than asking again, so declining location is never a dead end. Only the client knows whether it has asked yet, which is why the flag comes from there rather than being inferred. A nationwide search still needs an artist or a genre to match on; "concerts tonight" with no location and no anchor is refused with `code: "anchor_required"`.
+- Mood-to-genre mapping for vague queries. The model returns up to three genres constrained to Ticketmaster's Music segment ("chill" -> Jazz, Folk, Alternative), which become a comma-separated `classificationName`; Ticketmaster ORs them, so a mood searches the union of its genres. Free-text `keyword` is now reserved for something the user actually named, since Ticketmaster matches it literally and "chill" would match nothing.
+- Price, radius, and sort extraction. "under $60" sets `maxPrice`; Ticketmaster's events endpoint has no price parameter, so the ceiling comes back as a separate `filters` object and `searchConcerts` applies it to the events it gets, keeping any event whose published range overlaps the request and any event with no published range at all.
+- A one-sentence `interpretation` of the search in the response, and `locationSource` in `meta`, so the UI can say what it searched and which of the five sources located it.
+- Geolocated searches are sent to Ticketmaster as `geoPoint` - a geohash of the caller's coordinates - rather than the older `latlong` parameter, which the Discovery API documents as "deprecated and maybe removed in a future release, please use geoPoint instead". The Edge Function encodes the coordinates itself at nine characters of precision (a cell of roughly five metres); `radius` is what actually sets the search area.
+- `geoPoint`, `radius`, `unit`, `countryCode`, `sort`, `minPrice`, and `maxPrice` support in `lib/ticketmaster.ts` and `/api/concerts`, so the Edge Function's output can be handed straight to the route. `geoPoint`, `countryCode`, and `classificationName` now count as search anchors there, the last so a nationwide genre search isn't rejected.
+- `npm run test:functions` for the Edge Function's Deno test suite.
+
+### Changed
+
+- A `concert-query` search is located unless the caller has explicitly declined to share a location. The model no longer decides between a local and a national search - naming an artist is not naming a place, so "Radiohead tickets" geolocates like anything else, and only a refusal widens it.
+- `/test-concert-query` now asks the browser for coordinates only when the Edge Function says it needs them, then retries - with the coordinates if it got them, or with `geolocationDenied` if it didn't - so a query naming a city never triggers a permission prompt and a refused prompt still returns results. It displays the interpretation, the price filter, and which of the five sources located the search.
+- Raised the Edge Function's reasoning effort from `none` to `low` and its output cap from 300 to 700 tokens, since mapping a mood onto genres and a price ceiling is inference rather than pure extraction.
+- Updated the Expo mobile app's `@expo/ui`, `expo-dev-client`, `expo-image`, `expo-linking`, and `expo-router` dependencies to their latest SDK 57 patch releases, and registered the `expo-image` config plugin in `app.json`.
+
 ## [0.3.0] - 2026-08-24
 
 ### Added

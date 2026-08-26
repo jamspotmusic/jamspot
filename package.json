@@ -1,6 +1,6 @@
 {
   "name": "jamspot",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "workspaces": [
     "apps/*",
@@ -16,6 +16,7 @@
     "test:web": "npm run test --workspace=apps/web",
     "coverage:web": "npm run coverage --workspace=apps/web",
     "test:e2e": "npm run test:e2e --workspace=apps/web",
+    "test:functions": "cd supabase/functions/concert-query && deno test --allow-env",
     "lint": "npm run lint --workspaces --if-present",
     "test": "npm run test --workspaces --if-present"
   }
