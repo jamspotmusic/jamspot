@@ -56,3 +56,14 @@ apps/mobile/ios/
 apps/mobile/android/
 dist/
 expo-env.d.ts
+
+# Supabase CLI local state
+supabase/.temp/
+supabase/.branches/
+.supabase/
+
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/tasks.json
+!.vscode/launch.json
