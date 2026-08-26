@@ -1,5 +1,5 @@
 /*
- * Unit tests for the `concert-query` Edge Function (v0.3.0).
+ * Unit tests for the `concert-query` Edge Function.
  *
  * Run with `deno test` from supabase/functions/concert-query, or
  * `npm run test:functions` from the repo root.
@@ -18,15 +18,31 @@ import {
 } from "jsr:@std/assert@^1";
 
 import {
+  type CallerLocation,
+  DEFAULT_RADIUS_MILES,
+  encodeGeohash,
   extractOutputText,
+  geoFromHeaders,
   handleConcertQuery,
-  hasSearchAnchor,
+  hasNamedLocation,
+  MAX_GENRES,
+  MAX_RADIUS_MILES,
+  nationwideFallback,
+  normalizeCountryCode,
   normalizeCriteria,
   normalizeDateTime,
+  normalizeGenres,
   normalizeOptionalString,
+  normalizePrice,
+  normalizeRadiusMiles,
+  normalizeSort,
   normalizeStateCode,
   OPENAI_MODEL,
+  parseCallerLocation,
   type RawConcertCriteria,
+  resolveLocation,
+  type ResolvedLocation,
+  toPriceFilter,
   toTicketmasterParams,
 } from "./handler.ts";
 
@@ -34,7 +50,10 @@ import {
  * Test helpers
  * ---------------------------------------------------------------------- */
 
-/** A fully-null criteria object, so tests only spell out what they care about. */
+/**
+ * A criteria object with everything empty, so tests only spell out the fields
+ * they care about. With no location named, the search geolocates.
+ */
 function criteria(
   overrides: Partial<RawConcertCriteria> = {},
 ): RawConcertCriteria {
@@ -42,9 +61,45 @@ function criteria(
     city: null,
     stateCode: null,
     postalCode: null,
+    countryCode: null,
     keyword: null,
+    genres: null,
     startDateTime: null,
     endDateTime: null,
+    minPrice: null,
+    maxPrice: null,
+    radiusMiles: null,
+    sort: null,
+    interpretation: "Searching Ticketmaster.",
+    ...overrides,
+  };
+}
+
+function callerLocation(
+  overrides: Partial<CallerLocation> = {},
+): CallerLocation {
+  return {
+    latitude: null,
+    longitude: null,
+    city: null,
+    stateCode: null,
+    postalCode: null,
+    countryCode: null,
+    ...overrides,
+  };
+}
+
+function resolved(
+  overrides: Partial<ResolvedLocation> = {},
+): ResolvedLocation {
+  return {
+    source: "query",
+    geoPoint: null,
+    radiusMiles: null,
+    city: null,
+    stateCode: null,
+    postalCode: null,
+    countryCode: null,
     ...overrides,
   };
 }
@@ -82,6 +137,8 @@ type RunOptions = {
   method?: string;
   /** Raw request body. Objects are JSON-stringified; strings are sent as-is. */
   body?: unknown;
+  /** Edge geo headers on the inbound request. */
+  headers?: Record<string, string>;
   /** Pass null to simulate an unconfigured function. */
   apiKey?: string | null;
   /** What the stubbed fetch does. Defaults to a successful OpenAI response. */
@@ -95,6 +152,15 @@ type RunResult = {
   errors: unknown[][];
 };
 
+/** The default model output: an explicit, fully-anchored Oakland search. */
+function oaklandJazz() {
+  return criteria({
+    city: "Oakland",
+    stateCode: "CA",
+    genres: ["Jazz"],
+  });
+}
+
 /**
  * Invokes the handler with OPENAI_API_KEY, globalThis.fetch and console.error
  * all stubbed, and restores them afterwards.
@@ -103,11 +169,9 @@ async function run(
   {
     method = "POST",
     body = { query: "jazz in Oakland" },
+    headers = {},
     apiKey = "test-openai-key",
-    openAI = () =>
-      Response.json(
-        openAIPayload(criteria({ keyword: "jazz", city: "Oakland" })),
-      ),
+    openAI = () => Response.json(openAIPayload(oaklandJazz())),
   }: RunOptions = {},
 ): Promise<RunResult> {
   const originalFetch = globalThis.fetch;
@@ -141,8 +205,8 @@ async function run(
   try {
     const request = new Request("http://localhost/concert-query", {
       method,
-      ...(method === "GET" || body === undefined ? {} : {
-        headers: { "Content-Type": "application/json" },
+      ...(method === "GET" || body === undefined ? { headers } : {
+        headers: { "Content-Type": "application/json", ...headers },
         body: typeof body === "string" ? body : JSON.stringify(body),
       }),
     });
@@ -180,7 +244,7 @@ Deno.test("normalizeOptionalString treats a blank string as absent", () => {
 });
 
 /* -------------------------------------------------------------------------
- * normalizeStateCode
+ * normalizeStateCode / normalizeCountryCode
  * ---------------------------------------------------------------------- */
 
 Deno.test("normalizeStateCode uppercases a two-letter code", () => {
@@ -203,6 +267,17 @@ Deno.test("normalizeStateCode rejects anything that is not two letters", () => {
       "Invalid stateCode returned by model",
     );
   }
+});
+
+Deno.test("normalizeCountryCode uppercases and validates a country code", () => {
+  assertEquals(normalizeCountryCode("us"), "US");
+  assertEquals(normalizeCountryCode(null), null);
+
+  assertThrows(
+    () => normalizeCountryCode("USA"),
+    Error,
+    "Invalid countryCode returned by model",
+  );
 });
 
 /* -------------------------------------------------------------------------
@@ -243,39 +318,156 @@ Deno.test("normalizeDateTime throws, naming the field, on an unparseable date", 
 });
 
 /* -------------------------------------------------------------------------
+ * normalizeGenres
+ * ---------------------------------------------------------------------- */
+
+Deno.test("normalizeGenres keeps known Ticketmaster genres in order", () => {
+  assertEquals(
+    normalizeGenres(["Jazz", "Folk", "Alternative"]),
+    ["Jazz", "Folk", "Alternative"],
+  );
+});
+
+Deno.test("normalizeGenres canonicalizes casing and whitespace", () => {
+  assertEquals(normalizeGenres([" jazz ", "HIP-HOP/RAP"]), [
+    "Jazz",
+    "Hip-Hop/Rap",
+  ]);
+});
+
+Deno.test("normalizeGenres drops genres Ticketmaster does not have", () => {
+  // A silently wrong classificationName returns zero events with no error,
+  // so "chill" must never survive as a genre.
+  assertEquals(normalizeGenres(["chill", "vibey", "Jazz"]), ["Jazz"]);
+  assertEquals(normalizeGenres(["chill"]), null);
+});
+
+Deno.test("normalizeGenres de-duplicates and caps the list", () => {
+  assertEquals(normalizeGenres(["Jazz", "jazz", "JAZZ"]), ["Jazz"]);
+
+  assertEquals(
+    normalizeGenres(["Jazz", "Folk", "Rock", "Pop", "Metal"])?.length,
+    MAX_GENRES,
+  );
+});
+
+Deno.test("normalizeGenres treats a non-array or empty array as absent", () => {
+  assertEquals(normalizeGenres(null), null);
+  assertEquals(normalizeGenres([]), null);
+});
+
+/* -------------------------------------------------------------------------
+ * normalizePrice / normalizeRadiusMiles / normalizeSort / hasNamedLocation
+ * ---------------------------------------------------------------------- */
+
+Deno.test("normalizePrice rounds to whole cents", () => {
+  assertEquals(normalizePrice(60, "maxPrice"), 60);
+  assertEquals(normalizePrice(59.999, "maxPrice"), 60);
+  assertEquals(normalizePrice(0, "minPrice"), 0);
+  assertEquals(normalizePrice(null, "maxPrice"), null);
+});
+
+Deno.test("normalizePrice rejects negative and non-finite prices", () => {
+  for (const invalid of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assertThrows(
+      () => normalizePrice(invalid, "maxPrice"),
+      Error,
+      "Invalid maxPrice returned by model",
+    );
+  }
+});
+
+Deno.test("normalizeRadiusMiles rounds to an integer and clamps the top end", () => {
+  assertEquals(normalizeRadiusMiles(19.6), 20);
+  assertEquals(normalizeRadiusMiles(0.2), 1);
+  assertEquals(normalizeRadiusMiles(99_999), MAX_RADIUS_MILES);
+  assertEquals(normalizeRadiusMiles(null), null);
+});
+
+Deno.test("normalizeRadiusMiles rejects a non-positive radius", () => {
+  for (const invalid of [0, -5]) {
+    assertThrows(
+      () => normalizeRadiusMiles(invalid),
+      Error,
+      "Invalid radiusMiles returned by model",
+    );
+  }
+});
+
+Deno.test("normalizeSort accepts only Ticketmaster sort values", () => {
+  assertEquals(normalizeSort("date,asc"), "date,asc");
+  assertEquals(normalizeSort("distance,asc"), "distance,asc");
+  assertEquals(normalizeSort(null), null);
+
+  assertThrows(
+    () => normalizeSort("price,asc"),
+    Error,
+    "Invalid sort returned by model",
+  );
+});
+
+Deno.test("hasNamedLocation is true for any place the user named", () => {
+  for (
+    const field of ["city", "stateCode", "postalCode", "countryCode"] as const
+  ) {
+    assert(
+      hasNamedLocation(criteria({ [field]: "value" })),
+      `${field} alone counts as a named place`,
+    );
+  }
+});
+
+Deno.test("hasNamedLocation is false when only a keyword or genre was named", () => {
+  // The rule geolocation hangs off: naming an artist is not naming a place.
+  assertEquals(hasNamedLocation(criteria({ keyword: "Radiohead" })), false);
+  assertEquals(hasNamedLocation(criteria({ genres: ["Jazz"] })), false);
+  assertEquals(hasNamedLocation(criteria()), false);
+});
+
+/* -------------------------------------------------------------------------
  * normalizeCriteria
  * ---------------------------------------------------------------------- */
 
 Deno.test("normalizeCriteria normalizes every field at once", () => {
   assertEquals(
-    normalizeCriteria({
+    normalizeCriteria(criteria({
       city: "  Oakland  ",
       stateCode: "ca",
       postalCode: " 94607 ",
-      keyword: "  jazz ",
+      countryCode: "us",
+      keyword: "  The Bad Plus ",
+      genres: [" jazz "],
       startDateTime: "2026-08-29T00:00:00.000Z",
       endDateTime: "2026-08-31T23:59:59.999Z",
-    }),
-    {
+      minPrice: 20,
+      maxPrice: 59.999,
+      radiusMiles: 24.6,
+      sort: "date,asc",
+      interpretation: "  Jazz around Oakland this weekend.  ",
+    })),
+    criteria({
       city: "Oakland",
       stateCode: "CA",
       postalCode: "94607",
-      keyword: "jazz",
+      countryCode: "US",
+      keyword: "The Bad Plus",
+      genres: ["Jazz"],
       startDateTime: "2026-08-29T00:00:00Z",
       endDateTime: "2026-08-31T23:59:59Z",
-    },
+      minPrice: 20,
+      maxPrice: 60,
+      radiusMiles: 25,
+      sort: "date,asc",
+      interpretation: "Jazz around Oakland this weekend.",
+    }),
   );
-});
-
-Deno.test("normalizeCriteria keeps an all-null result all-null", () => {
-  assertEquals(normalizeCriteria(criteria()), criteria());
 });
 
 Deno.test("normalizeCriteria rejects a start date after the end date", () => {
   assertThrows(
     () =>
       normalizeCriteria(criteria({
-        keyword: "jazz",
+        genres: ["Jazz"],
         startDateTime: "2026-08-31T00:00:00Z",
         endDateTime: "2026-08-29T00:00:00Z",
       })),
@@ -284,7 +476,15 @@ Deno.test("normalizeCriteria rejects a start date after the end date", () => {
   );
 });
 
-Deno.test("normalizeCriteria allows a zero-length range", () => {
+Deno.test("normalizeCriteria rejects a price floor above the ceiling", () => {
+  assertThrows(
+    () => normalizeCriteria(criteria({ minPrice: 100, maxPrice: 60 })),
+    Error,
+    "minPrice is above maxPrice",
+  );
+});
+
+Deno.test("normalizeCriteria allows a zero-length date range", () => {
   const result = normalizeCriteria(criteria({
     startDateTime: "2026-08-29T00:00:00Z",
     endDateTime: "2026-08-29T00:00:00Z",
@@ -304,66 +504,449 @@ Deno.test("normalizeCriteria does not compare against a missing bound", () => {
 });
 
 /* -------------------------------------------------------------------------
- * hasSearchAnchor
+ * parseCallerLocation
  * ---------------------------------------------------------------------- */
 
-Deno.test("hasSearchAnchor accepts any single location or keyword field", () => {
+Deno.test("parseCallerLocation reads device coordinates", () => {
+  assertObjectMatch(
+    parseCallerLocation({ latitude: 37.8044, longitude: -122.2712 }),
+    { latitude: 37.8044, longitude: -122.2712 },
+  );
+});
+
+Deno.test("parseCallerLocation drops out-of-range or partial coordinates", () => {
   for (
-    const field of
-      ["city", "stateCode", "postalCode", "keyword"] as const
+    const invalid of [
+      { latitude: 91, longitude: 0 },
+      { latitude: 0, longitude: 181 },
+      { latitude: 37.8 },
+      { longitude: -122.3 },
+      { latitude: "37.8", longitude: "-122.3" },
+    ]
   ) {
-    assert(
-      hasSearchAnchor(criteria({ [field]: "value" })),
-      `${field} alone should anchor the search`,
+    const parsed = parseCallerLocation(invalid);
+
+    assertEquals(parsed.latitude, null, JSON.stringify(invalid));
+    assertEquals(parsed.longitude, null, JSON.stringify(invalid));
+  }
+});
+
+Deno.test("parseCallerLocation drops a malformed state or country code", () => {
+  // Unlike the model's output, this is untrusted client input: ignore the bad
+  // field rather than failing the whole request.
+  const parsed = parseCallerLocation({
+    city: " Oakland ",
+    stateCode: "California",
+    countryCode: "USA",
+    postalCode: "94607",
+  });
+
+  assertEquals(parsed.city, "Oakland");
+  assertEquals(parsed.stateCode, null);
+  assertEquals(parsed.countryCode, null);
+  assertEquals(parsed.postalCode, "94607");
+});
+
+Deno.test("parseCallerLocation treats anything that is not an object as absent", () => {
+  for (const value of [undefined, null, "Oakland", 42, ["Oakland"]]) {
+    assertEquals(parseCallerLocation(value), callerLocation());
+  }
+});
+
+/* -------------------------------------------------------------------------
+ * geoFromHeaders
+ * ---------------------------------------------------------------------- */
+
+Deno.test("geoFromHeaders reads Vercel-style geo headers", () => {
+  const geo = geoFromHeaders(
+    new Headers({
+      "x-vercel-ip-latitude": "37.8044",
+      "x-vercel-ip-longitude": "-122.2712",
+      "x-vercel-ip-city": "San%20Francisco",
+      "x-vercel-ip-country-region": "CA",
+      "x-vercel-ip-postal-code": "94103",
+      "x-vercel-ip-country": "US",
+    }),
+  );
+
+  assertEquals(geo, {
+    latitude: 37.8044,
+    longitude: -122.2712,
+    city: "San Francisco",
+    stateCode: "CA",
+    postalCode: "94103",
+    countryCode: "US",
+  });
+});
+
+Deno.test("geoFromHeaders reads Cloudflare-style geo headers", () => {
+  const geo = geoFromHeaders(
+    new Headers({
+      "cf-iplatitude": "37.8044",
+      "cf-iplongitude": "-122.2712",
+      "cf-ipcity": "Oakland",
+      "cf-region-code": "ca",
+      "cf-ipcountry": "us",
+    }),
+  );
+
+  assertObjectMatch(geo, {
+    latitude: 37.8044,
+    city: "Oakland",
+    stateCode: "CA",
+    countryCode: "US",
+  });
+});
+
+Deno.test("geoFromHeaders returns nothing when the edge supplies no geo", () => {
+  assertEquals(
+    geoFromHeaders(new Headers({ "user-agent": "jamspot-tests" })),
+    callerLocation(),
+  );
+});
+
+Deno.test("geoFromHeaders ignores unparseable coordinates", () => {
+  const geo = geoFromHeaders(
+    new Headers({
+      "x-vercel-ip-latitude": "unknown",
+      "x-vercel-ip-longitude": "-122.2712",
+      "x-vercel-ip-city": "Oakland",
+    }),
+  );
+
+  assertEquals(geo.latitude, null);
+  assertEquals(geo.longitude, null);
+  assertEquals(geo.city, "Oakland");
+});
+
+/* -------------------------------------------------------------------------
+ * encodeGeohash
+ * ---------------------------------------------------------------------- */
+
+Deno.test("encodeGeohash matches the reference vectors", () => {
+  // The canonical example from the geohash literature.
+  assertEquals(encodeGeohash(57.64911, 10.40744, 11), "u4pruydqqvj");
+  assertEquals(encodeGeohash(0, 0, 9), "s00000000");
+  assertEquals(encodeGeohash(37.8044, -122.2712), "9q9p1dhfd");
+});
+
+Deno.test("encodeGeohash honours the requested precision", () => {
+  // Shorter hashes are prefixes of longer ones: the same point, a coarser cell.
+  const full = encodeGeohash(37.8044, -122.2712, 9);
+
+  for (let precision = 1; precision <= 9; precision++) {
+    assertEquals(
+      encodeGeohash(37.8044, -122.2712, precision),
+      full.slice(0, precision),
+      `precision ${precision}`,
     );
   }
 });
 
-Deno.test("hasSearchAnchor rejects a dates-only query", () => {
-  // "concerts this weekend" - no location, no keyword, and we never invent one.
+Deno.test("encodeGeohash separates the hemispheres", () => {
+  // First character encodes the quadrant, so these must not collide.
+  const hashes = new Set([
+    encodeGeohash(37.8, -122.3),
+    encodeGeohash(37.8, 122.3),
+    encodeGeohash(-37.8, -122.3),
+    encodeGeohash(-37.8, 122.3),
+  ]);
+
+  assertEquals(hashes.size, 4);
+});
+
+/* -------------------------------------------------------------------------
+ * resolveLocation
+ * ---------------------------------------------------------------------- */
+
+const noHeaders = new Headers();
+
+Deno.test("resolveLocation uses the place the user named", () => {
   assertEquals(
-    hasSearchAnchor(criteria({
-      startDateTime: "2026-08-29T00:00:00Z",
-      endDateTime: "2026-08-31T00:00:00Z",
-    })),
-    false,
+    resolveLocation(
+      criteria({ city: "Oakland", stateCode: "CA" }),
+      // Present, and deliberately ignored: the query wins.
+      callerLocation({ latitude: 40.7, longitude: -74 }),
+      noHeaders,
+    ),
+    resolved({ source: "query", city: "Oakland", stateCode: "CA" }),
   );
 });
 
-Deno.test("hasSearchAnchor rejects an entirely empty result", () => {
-  assertEquals(hasSearchAnchor(criteria()), false);
+Deno.test("resolveLocation geolocates a named artist with no place", () => {
+  // The behaviour this rework exists for: naming Radiohead is not naming a
+  // place, so the search runs near the caller rather than nationwide.
+  assertEquals(
+    resolveLocation(
+      criteria({ keyword: "Radiohead" }),
+      callerLocation({ latitude: 37.8, longitude: -122.3 }),
+      noHeaders,
+    ),
+    resolved({
+      source: "device",
+      geoPoint: encodeGeohash(37.8, -122.3),
+      radiusMiles: DEFAULT_RADIUS_MILES,
+    }),
+  );
+});
+
+Deno.test("resolveLocation prefers device coordinates for a nearby search", () => {
+  assertEquals(
+    resolveLocation(
+      criteria({ genres: ["Jazz"] }),
+      callerLocation({
+        latitude: 37.8044,
+        longitude: -122.2712,
+        city: "Somewhere Stale",
+        countryCode: "US",
+      }),
+      new Headers({ "cf-ipcity": "Ashburn" }),
+      ),
+    resolved({
+      source: "device",
+      geoPoint: "9q9p1dhfd",
+      radiusMiles: DEFAULT_RADIUS_MILES,
+      countryCode: "US",
+    }),
+  );
+});
+
+Deno.test("resolveLocation honours a radius the user implied", () => {
+  const location = resolveLocation(
+    criteria({ radiusMiles: 20 }),
+    callerLocation({ latitude: 37.8, longitude: -122.3 }),
+    noHeaders,
+  );
+
+  assertEquals(location?.radiusMiles, 20);
+});
+
+Deno.test("resolveLocation falls back to a place the caller already knew", () => {
+  assertEquals(
+    resolveLocation(
+      criteria(),
+      callerLocation({ city: "Oakland", stateCode: "CA" }),
+      noHeaders,
+    ),
+    resolved({ source: "caller-place", city: "Oakland", stateCode: "CA" }),
+  );
+});
+
+Deno.test("resolveLocation falls back to the edge network's approximate geo", () => {
+  assertEquals(
+    resolveLocation(
+      criteria(),
+      callerLocation(),
+      new Headers({
+        "cf-iplatitude": "37.8044",
+        "cf-iplongitude": "-122.2712",
+        "cf-ipcountry": "US",
+      }),
+    ),
+    resolved({
+      source: "ip",
+      geoPoint: "9q9p1dhfd",
+      radiusMiles: DEFAULT_RADIUS_MILES,
+      countryCode: "US",
+    }),
+  );
+});
+
+Deno.test("resolveLocation uses an IP-derived city when there are no coordinates", () => {
+  assertEquals(
+    resolveLocation(
+      criteria(),
+      callerLocation(),
+      new Headers({ "cf-ipcity": "Oakland", "cf-region-code": "CA" }),
+    ),
+    resolved({ source: "ip", city: "Oakland", stateCode: "CA" }),
+  );
+});
+
+Deno.test("resolveLocation gives up rather than guessing a city", () => {
+  assertEquals(
+    resolveLocation(
+      criteria({ genres: ["Jazz"] }),
+      callerLocation(),
+      noHeaders,
+    ),
+    null,
+  );
+});
+
+Deno.test("resolveLocation only attaches a radius Ticketmaster would honour", () => {
+  // Ticketmaster ignores radius next to a bare city or state.
+  const city = resolveLocation(
+    criteria({ radiusMiles: 20 }),
+    callerLocation({ city: "Oakland" }),
+    noHeaders,
+  );
+
+  assertEquals(city?.radiusMiles, null);
+
+  const zip = resolveLocation(
+    criteria({ radiusMiles: 20 }),
+    callerLocation({ postalCode: "94607" }),
+    noHeaders,
+  );
+
+  assertEquals(zip?.radiusMiles, 20);
+});
+
+/* -------------------------------------------------------------------------
+ * nationwideFallback
+ * ---------------------------------------------------------------------- */
+
+Deno.test("nationwideFallback needs something to match on", () => {
+  assertEquals(
+    nationwideFallback(criteria({ keyword: "Radiohead" })),
+    resolved({ source: "nationwide" }),
+  );
+
+  assertEquals(
+    nationwideFallback(criteria({ genres: ["Jazz"] })),
+    resolved({ source: "nationwide" }),
+  );
+});
+
+Deno.test("nationwideFallback refuses a search with nothing to match on", () => {
+  // Every music event in the country is not an answer to "concerts tonight".
+  assertEquals(
+    nationwideFallback(criteria({
+      startDateTime: "2026-08-29T00:00:00Z",
+      endDateTime: "2026-08-31T00:00:00Z",
+    })),
+    null,
+  );
 });
 
 /* -------------------------------------------------------------------------
  * toTicketmasterParams
  * ---------------------------------------------------------------------- */
 
-Deno.test("toTicketmasterParams omits null fields entirely", () => {
-  const params = toTicketmasterParams(criteria({ keyword: "jazz" }));
+Deno.test("toTicketmasterParams defaults to the music classification", () => {
+  assertEquals(
+    toTicketmasterParams(
+      criteria({ keyword: "Radiohead" }),
+      resolved({ city: "Oakland" }),
+    ),
+    { keyword: "Radiohead", classificationName: "music", city: "Oakland" },
+  );
+});
 
-  assertEquals(params, { keyword: "jazz" });
-  assertEquals(Object.keys(params), ["keyword"]);
+Deno.test("toTicketmasterParams ORs genres instead of the music default", () => {
+  // Ticketmaster ORs repeated classification values, so a mood becomes a
+  // union of genres. Keeping "music" in the list would widen it back out.
+  assertEquals(
+    toTicketmasterParams(
+      criteria({ genres: ["Jazz", "Folk", "Alternative"] }),
+      resolved({ city: "Oakland" }),
+    ).classificationName,
+    "Jazz,Folk,Alternative",
+  );
+});
+
+Deno.test("toTicketmasterParams maps a geolocated search to geoPoint and radius", () => {
+  assertEquals(
+    toTicketmasterParams(
+      criteria({ genres: ["Jazz"] }),
+      resolved({
+        source: "device",
+        geoPoint: "9q9p1dhfd",
+        radiusMiles: 50,
+      }),
+    ),
+    {
+      classificationName: "Jazz",
+      geoPoint: "9q9p1dhfd",
+      radius: 50,
+      unit: "miles",
+    },
+  );
+});
+
+Deno.test("toTicketmasterParams drops a radius with no point to measure from", () => {
+  const params = toTicketmasterParams(
+    criteria(),
+    resolved({ source: "query", city: "Oakland", radiusMiles: 25 }),
+  );
+
+  assertEquals(params.radius, undefined);
+  assertEquals(params.unit, undefined);
+});
+
+Deno.test("toTicketmasterParams downgrades distance sorting without coordinates", () => {
+  assertEquals(
+    toTicketmasterParams(
+      criteria({ sort: "distance,asc" }),
+      resolved({ source: "query", city: "Oakland" }),
+    ).sort,
+    "date,asc",
+  );
+
+  assertEquals(
+    toTicketmasterParams(
+      criteria({ sort: "distance,asc" }),
+      resolved({ source: "device", geoPoint: encodeGeohash(37.8, -122.3) }),
+    ).sort,
+    "distance,asc",
+  );
 });
 
 Deno.test("toTicketmasterParams maps every supplied field", () => {
   assertEquals(
-    toTicketmasterParams({
-      city: "Oakland",
-      stateCode: "CA",
-      postalCode: "94607",
-      keyword: "jazz",
-      startDateTime: "2026-08-29T00:00:00Z",
-      endDateTime: "2026-08-31T23:59:59Z",
-    }),
+    toTicketmasterParams(
+      criteria({
+        keyword: "The Bad Plus",
+        genres: ["Jazz"],
+        startDateTime: "2026-08-29T00:00:00Z",
+        endDateTime: "2026-08-31T23:59:59Z",
+        sort: "relevance,desc",
+      }),
+      resolved({
+        source: "query",
+        city: "Oakland",
+        stateCode: "CA",
+        postalCode: "94607",
+        countryCode: "US",
+        radiusMiles: 25,
+      }),
+    ),
     {
+      keyword: "The Bad Plus",
+      classificationName: "Jazz",
       city: "Oakland",
       stateCode: "CA",
       postalCode: "94607",
-      keyword: "jazz",
+      countryCode: "US",
+      radius: 25,
+      unit: "miles",
       startDateTime: "2026-08-29T00:00:00Z",
       endDateTime: "2026-08-31T23:59:59Z",
+      sort: "relevance,desc",
     },
   );
+});
+
+/* -------------------------------------------------------------------------
+ * toPriceFilter
+ * ---------------------------------------------------------------------- */
+
+Deno.test("toPriceFilter returns null when the user set no limit", () => {
+  assertEquals(toPriceFilter(criteria()), null);
+});
+
+Deno.test("toPriceFilter carries each supplied bound", () => {
+  assertEquals(toPriceFilter(criteria({ maxPrice: 60 })), {
+    maxPrice: 60,
+    currency: "USD",
+  });
+
+  assertEquals(toPriceFilter(criteria({ minPrice: 20, maxPrice: 60 })), {
+    minPrice: 20,
+    maxPrice: 60,
+    currency: "USD",
+  });
 });
 
 /* -------------------------------------------------------------------------
@@ -440,7 +1023,11 @@ Deno.test("handleConcertQuery returns 400 for a body that is not JSON", async ()
 });
 
 Deno.test("handleConcertQuery returns 400 for a missing, blank, or non-string query", async () => {
-  for (const body of [{}, { query: "" }, { query: "   " }, { query: 42 }, { query: null }]) {
+  for (
+    const body of [{}, { query: "" }, { query: "   " }, { query: 42 }, {
+      query: null,
+    }]
+  ) {
     const { response, json, requests } = await run({ body });
 
     assertEquals(response.status, 400, `body: ${JSON.stringify(body)}`);
@@ -487,10 +1074,10 @@ Deno.test("handleConcertQuery calls the Responses API with the documented settin
 
   assertObjectMatch(request.body, {
     model: "gpt-5.6-luna",
-    // Parameter extraction, not a reasoning task.
-    reasoning: { effort: "none" },
+    // Extraction plus a little mood-to-genre inference.
+    reasoning: { effort: "low" },
     store: false,
-    max_output_tokens: 300,
+    max_output_tokens: 700,
   });
 });
 
@@ -514,32 +1101,63 @@ Deno.test("handleConcertQuery requests strict JSON-schema structured output", as
     "city",
     "stateCode",
     "postalCode",
+    "countryCode",
     "keyword",
+    "genres",
     "startDateTime",
     "endDateTime",
+    "minPrice",
+    "maxPrice",
+    "radiusMiles",
+    "sort",
+    "interpretation",
   ]);
 });
 
-Deno.test("handleConcertQuery sends the model only the query, timestamp, and time zone", async () => {
+Deno.test("handleConcertQuery constrains genres to Ticketmaster's own list", async () => {
+  const { requests } = await run();
+
+  const schema = (requests[0].body.text as {
+    format: {
+      schema: {
+        properties: { genres: { items: { enum: string[] } } };
+      };
+    };
+  }).format.schema;
+
+  assert(schema.properties.genres.items.enum.includes("Jazz"));
+  assertEquals(schema.properties.genres.items.enum.includes("Chill"), false);
+});
+
+Deno.test("handleConcertQuery never sends the caller's location to the model", async () => {
   const { requests } = await run({
     body: {
-      query: "  jazz in Oakland  ",
+      query: "  chill concert under $60  ",
       timeZone: "America/Los_Angeles",
-      // Anything else the caller sends must not reach the model.
+      // The handler uses this; the model must never see it.
+      location: { latitude: 37.8044, longitude: -122.2712, city: "Oakland" },
       userId: "user-123",
-      latitude: 37.8,
-      longitude: -122.27,
+    },
+    headers: {
+      "cf-iplatitude": "37.8044",
+      "cf-iplongitude": "-122.2712",
+      "cf-ipcity": "Oakland",
     },
   });
 
+  // `input` is the only part of the request that carries anything
+  // per-caller; `instructions` is a static prompt.
   const input = JSON.parse(requests[0].body.input as string);
+
+  assertEquals(String(input).includes("37.8044"), false);
+  assertEquals(String(requests[0].body.input).includes("Oakland"), false);
 
   assertEquals(Object.keys(input).sort(), [
     "currentDateTime",
     "query",
     "timeZone",
   ]);
-  assertEquals(input.query, "jazz in Oakland", "query is trimmed");
+  assertEquals(input.query, "chill concert under $60", "query is trimmed");
   assertEquals(input.timeZone, "America/Los_Angeles");
   assertMatch(input.currentDateTime, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/);
 });
@@ -554,69 +1172,152 @@ Deno.test("handleConcertQuery defaults the time zone to UTC", async () => {
   }
 });
 
-Deno.test("handleConcertQuery instructs the model not to guess a location", async () => {
+Deno.test("handleConcertQuery instructs the model to delegate geolocation, not perform it", async () => {
   const { requests } = await run();
 
   const instructions = String(requests[0].body.instructions);
 
+  assertMatch(instructions, /You never guess where the user is/);
   assertMatch(instructions, /Do not guess a user's city, state, ZIP code/);
   assertMatch(instructions, /Do not infer location from the supplied timeZone/);
-  assertMatch(instructions, /Do not perform geolocation/);
+  assertMatch(
+    instructions,
+    /Every such search runs near the user,\s+including one that names an artist/,
+  );
+  assertMatch(instructions, /Never manufacture a location the user did not give you/);
   assertMatch(instructions, /Do not claim a concert exists/);
-  assertMatch(instructions, /Never use your knowledge cutoff as the current date/);
+  assertMatch(
+    instructions,
+    /Never use your knowledge cutoff as the current date/,
+  );
 });
 
 /* -------------------------------------------------------------------------
  * handleConcertQuery - success
  * ---------------------------------------------------------------------- */
 
-Deno.test("handleConcertQuery returns the extracted Ticketmaster parameters", async () => {
+Deno.test("handleConcertQuery returns the parameters for an explicit search", async () => {
   const { response, json } = await run({
-    body: { query: "jazz in Oakland this weekend", timeZone: "America/Los_Angeles" },
+    body: {
+      query: "jazz in Oakland this weekend",
+      timeZone: "America/Los_Angeles",
+    },
     openAI: () =>
       Response.json(openAIPayload(criteria({
         city: " Oakland ",
         stateCode: "ca",
-        keyword: "jazz",
+        genres: ["Jazz"],
         startDateTime: "2026-08-29T07:00:00.000Z",
         endDateTime: "2026-08-31T06:59:59.999Z",
+        sort: "date,asc",
+        interpretation: "Jazz shows around Oakland this weekend.",
       }))),
   });
 
   assertEquals(response.status, 200);
   assertEquals(json.query, "jazz in Oakland this weekend");
+  assertEquals(json.interpretation, "Jazz shows around Oakland this weekend.");
   assertEquals(json.ticketmasterParams, {
+    classificationName: "Jazz",
     city: "Oakland",
     stateCode: "CA",
-    keyword: "jazz",
     startDateTime: "2026-08-29T07:00:00Z",
     endDateTime: "2026-08-31T06:59:59Z",
+    sort: "date,asc",
   });
+  assertEquals(json.filters, undefined, "no price limit was asked for");
 
   const meta = json.meta as Record<string, string>;
   assertEquals(meta.model, OPENAI_MODEL);
   assertEquals(meta.timeZone, "America/Los_Angeles");
+  assertEquals(meta.locationSource, "query");
   assertMatch(meta.currentDateTime, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/);
 });
 
-Deno.test("handleConcertQuery returns a keyword-only query with no location", async () => {
-  // "jazz this weekend" is valid: keyword anchors the search, and we do not
-  // manufacture a city the user never supplied.
+Deno.test('handleConcertQuery geolocates "chill concert under $60"', async () => {
+  // The example this rework exists for: no artist, no city, a mood and a
+  // price ceiling. The model asks for the caller's location; the handler
+  // supplies it and turns the mood into real Ticketmaster genres.
   const { response, json } = await run({
-    body: { query: "jazz this weekend" },
+    body: {
+      query: "chill concert under $60",
+      timeZone: "America/Los_Angeles",
+      location: { latitude: 37.8044, longitude: -122.2712 },
+    },
     openAI: () =>
       Response.json(openAIPayload(criteria({
-        keyword: "jazz",
-        startDateTime: "2026-08-29T00:00:00Z",
-        endDateTime: "2026-08-31T00:00:00Z",
+        genres: ["Jazz", "Folk", "Alternative"],
+        maxPrice: 60,
+        sort: "distance,asc",
+        interpretation: "Laid-back shows near you with tickets under $60.",
       }))),
   });
 
   assertEquals(response.status, 200);
   assertEquals(json.ticketmasterParams, {
-    keyword: "jazz",
-    startDateTime: "2026-08-29T00:00:00Z",
-    endDateTime: "2026-08-31T00:00:00Z",
+    classificationName: "Jazz,Folk,Alternative",
+    geoPoint: "9q9p1dhfd",
+    radius: DEFAULT_RADIUS_MILES,
+    unit: "miles",
+    sort: "distance,asc",
+  });
+  // Ticketmaster has no price parameter, so the ceiling comes back as a
+  // filter for the caller to apply to the events it gets.
+  assertEquals(json.filters, { maxPrice: 60, currency: "USD" });
+  assertEquals(json.interpretation, "Laid-back shows near you with tickets under $60.");
+
+  assertObjectMatch(json.meta as Record<string, unknown>, {
+    locationSource: "device",
+  });
+});
+
+Deno.test("handleConcertQuery geolocates from edge headers when the caller sends none", async () => {
+  const { response, json } = await run({
+    body: { query: "something fun tonight" },
+    headers: {
+      "x-vercel-ip-latitude": "37.8044",
+      "x-vercel-ip-longitude": "-122.2712",
+    },
+    openAI: () =>
+      Response.json(openAIPayload(criteria({ genres: ["Pop"] }))),
+  });
+
+  assertEquals(response.status, 200);
+  assertObjectMatch(json.ticketmasterParams as Record<string, unknown>, {
+    geoPoint: "9q9p1dhfd",
+    radius: DEFAULT_RADIUS_MILES,
+  });
+  assertObjectMatch(json.meta as Record<string, unknown>, {
+    locationSource: "ip",
+  });
+});
+
+Deno.test("handleConcertQuery geolocates a named-artist search too", async () => {
+  // Naming an artist is not naming a place, so this runs near the caller
+  // rather than nationwide.
+  const { response, json } = await run({
+    body: {
+      query: "Radiohead tickets",
+      location: { latitude: 37.8044, longitude: -122.2712 },
+    },
+    openAI: () =>
+      Response.json(openAIPayload(criteria({
+        keyword: "Radiohead",
+        sort: "relevance,desc",
+      }))),
+  });
+
+  assertEquals(response.status, 200);
+  assertEquals(json.ticketmasterParams, {
+    keyword: "Radiohead",
+    classificationName: "music",
+    geoPoint: "9q9p1dhfd",
+    radius: DEFAULT_RADIUS_MILES,
+    unit: "miles",
+    sort: "relevance,desc",
+  });
+  assertObjectMatch(json.meta as Record<string, unknown>, {
+    locationSource: "device",
   });
 });
 
@@ -624,13 +1325,16 @@ Deno.test("handleConcertQuery reports the model the API actually served", async 
   const { json } = await run({
     openAI: () =>
       Response.json(
-        openAIPayload(criteria({ keyword: "jazz" }), {
+        openAIPayload(oaklandJazz(), {
           model: "gpt-5.6-luna-2026-07-01",
         }),
       ),
   });
 
-  assertEquals((json.meta as Record<string, string>).model, "gpt-5.6-luna-2026-07-01");
+  assertEquals(
+    (json.meta as Record<string, string>).model,
+    "gpt-5.6-luna-2026-07-01",
+  );
 });
 
 Deno.test("handleConcertQuery falls back to the configured model name in meta", async () => {
@@ -641,7 +1345,7 @@ Deno.test("handleConcertQuery falls back to the configured model name in meta", 
           type: "message",
           content: [{
             type: "output_text",
-            text: JSON.stringify(criteria({ keyword: "jazz" })),
+            text: JSON.stringify(oaklandJazz()),
           }],
         }],
       }),
@@ -651,33 +1355,142 @@ Deno.test("handleConcertQuery falls back to the configured model name in meta", 
 });
 
 /* -------------------------------------------------------------------------
- * handleConcertQuery - rejection of un-anchored queries
+ * handleConcertQuery - when the caller cannot be located
  * ---------------------------------------------------------------------- */
 
-Deno.test("handleConcertQuery returns 422 when nothing anchors the search", async () => {
+Deno.test("handleConcertQuery asks for a location instead of guessing one", async () => {
   const { response, json } = await run({
-    body: { query: "concerts this weekend" },
+    // No caller location, no edge geo headers.
+    body: { query: "chill concert under $60" },
     openAI: () =>
       Response.json(openAIPayload(criteria({
-        startDateTime: "2026-08-29T00:00:00Z",
-        endDateTime: "2026-08-31T00:00:00Z",
+        genres: ["Jazz", "Folk"],
+        maxPrice: 60,
+        interpretation: "Laid-back shows near you with tickets under $60.",
       }))),
   });
 
   assertEquals(response.status, 422);
+  assertEquals(json.code, "location_required");
+  assertEquals(
+    json.error,
+    "Share your location or name a city to find shows near you.",
+  );
+  // The client needs this to explain what it is asking permission for.
+  assertEquals(
+    json.interpretation,
+    "Laid-back shows near you with tickets under $60.",
+  );
+});
+
+Deno.test("handleConcertQuery asks for a location even when an artist was named", async () => {
+  // The client hasn't reported a refusal yet, so it is asked to try.
+  const { response, json } = await run({
+    body: { query: "Radiohead tickets" },
+    openAI: () =>
+      Response.json(openAIPayload(criteria({ keyword: "Radiohead" }))),
+  });
+
+  assertEquals(response.status, 422);
+  assertEquals(json.code, "location_required");
+});
+
+Deno.test("handleConcertQuery searches nationwide once the caller refuses a location", async () => {
+  const { response, json } = await run({
+    body: { query: "Radiohead tickets", geolocationDenied: true },
+    openAI: () =>
+      Response.json(openAIPayload(criteria({
+        keyword: "Radiohead",
+        sort: "relevance,desc",
+      }))),
+  });
+
+  assertEquals(response.status, 200);
+  assertEquals(json.ticketmasterParams, {
+    keyword: "Radiohead",
+    classificationName: "music",
+    sort: "relevance,desc",
+  });
+  assertObjectMatch(json.meta as Record<string, unknown>, {
+    locationSource: "nationwide",
+  });
+});
+
+Deno.test("handleConcertQuery widens a genre search nationwide too", async () => {
+  const { response, json } = await run({
+    body: { query: "chill concert under $60", geolocationDenied: true },
+    openAI: () =>
+      Response.json(openAIPayload(criteria({
+        genres: ["Jazz", "Folk"],
+        maxPrice: 60,
+        // Only meaningful with coordinates; downgraded on the way out.
+        sort: "distance,asc",
+      }))),
+  });
+
+  assertEquals(response.status, 200);
+  assertEquals(json.ticketmasterParams, {
+    classificationName: "Jazz,Folk",
+    sort: "date,asc",
+  });
+  assertEquals(json.filters, { maxPrice: 60, currency: "USD" });
+});
+
+Deno.test("handleConcertQuery still prefers a real location over the fallback", async () => {
+  // The flag only matters when nothing else can locate the caller.
+  const { response, json } = await run({
+    body: {
+      query: "Radiohead tickets",
+      geolocationDenied: true,
+      location: { latitude: 37.8044, longitude: -122.2712 },
+    },
+    openAI: () =>
+      Response.json(openAIPayload(criteria({ keyword: "Radiohead" }))),
+  });
+
+  assertEquals(response.status, 200);
+  assertObjectMatch(json.meta as Record<string, unknown>, {
+    locationSource: "device",
+  });
+});
+
+Deno.test("handleConcertQuery refuses a refused-location search with nothing to match on", async () => {
+  const { response, json } = await run({
+    body: { query: "concerts tonight", geolocationDenied: true },
+    openAI: () =>
+      Response.json(openAIPayload(criteria({
+        startDateTime: "2026-08-29T00:00:00Z",
+        endDateTime: "2026-08-30T06:59:59Z",
+      }))),
+  });
+
+  assertEquals(response.status, 422);
+  assertEquals(json.code, "anchor_required");
   assertEquals(
     json.error,
     "Include an artist, genre, venue, event, city, state, or ZIP code.",
   );
 });
 
-Deno.test("handleConcertQuery treats whitespace-only model output as absent", async () => {
-  const { response } = await run({
+Deno.test("handleConcertQuery treats a whitespace-only place as no place", async () => {
+  // Blank is not a location, so this geolocates rather than sending
+  // Ticketmaster an empty city.
+  const { response, json } = await run({
+    body: {
+      query: "concerts",
+      location: { latitude: 37.8044, longitude: -122.2712 },
+    },
     openAI: () =>
-      Response.json(openAIPayload(criteria({ city: "   ", keyword: "  " }))),
+      Response.json(openAIPayload(criteria({ city: "   ", stateCode: "  " }))),
   });
 
-  assertEquals(response.status, 422);
+  assertEquals(response.status, 200);
+  assertObjectMatch(json.ticketmasterParams as Record<string, unknown>, {
+    geoPoint: "9q9p1dhfd",
+  });
+  assertObjectMatch(json.meta as Record<string, unknown>, {
+    locationSource: "device",
+  });
 });
 
 /* -------------------------------------------------------------------------
@@ -739,16 +1552,23 @@ Deno.test("handleConcertQuery returns 502 when the output text is not JSON", asy
 
 Deno.test("handleConcertQuery returns 502 when normalization rejects the output", async () => {
   const cases: Array<[string, RawConcertCriteria]> = [
-    ["bad stateCode", criteria({ keyword: "jazz", stateCode: "California" })],
-    ["bad date", criteria({ keyword: "jazz", startDateTime: "this weekend" })],
     [
-      "inverted range",
+      "bad stateCode",
+      criteria({ city: "Oakland", stateCode: "California" }),
+    ],
+    ["bad countryCode", criteria({ countryCode: "USA" })],
+    ["bad date", criteria({ genres: ["Jazz"], startDateTime: "this weekend" })],
+    [
+      "inverted date range",
       criteria({
-        keyword: "jazz",
+        genres: ["Jazz"],
         startDateTime: "2026-08-31T00:00:00Z",
         endDateTime: "2026-08-29T00:00:00Z",
       }),
     ],
+    ["inverted price range", criteria({ minPrice: 100, maxPrice: 60 })],
+    ["negative price", criteria({ maxPrice: -1 })],
+    ["unknown sort", criteria({ genres: ["Jazz"], sort: "price,asc" })],
   ];
 
   for (const [label, output] of cases) {
