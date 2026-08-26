@@ -18,9 +18,26 @@ export type TicketmasterSearchParams = {
   stateCode?: string;
   /** US postal / ZIP code */
   postalCode?: string;
+  /** Two-letter ISO country code, e.g. "US" */
+  countryCode?: string;
+  /**
+   * Geohash of a point to search around - the geolocated form of a "near me"
+   * search. Ticketmaster's older `latlong` parameter is documented as
+   * "deprecated and maybe removed in a future release, please use geoPoint
+   * instead", so coordinates are encoded as a geohash before they get here.
+   */
+  geoPoint?: string;
+  /** Search radius around geoPoint / postalCode */
+  radius?: number;
+  /** Unit for radius. Defaults to "miles". */
+  unit?: "miles" | "km";
   /** Free-text search - artist name, event name, etc. */
   keyword?: string;
-  /** Ticketmaster classification. Defaults to "music". */
+  /**
+   * Ticketmaster classification. Defaults to "music". Multiple comma-separated
+   * values are ORed, which is how a mood search ("chill") becomes a union of
+   * genres ("Jazz,Folk,Alternative").
+   */
   classificationName?: string;
   /** ISO 8601 date-time, e.g. "2026-08-01T00:00:00Z" */
   startDateTime?: string;
@@ -31,6 +48,13 @@ export type TicketmasterSearchParams = {
   page?: number;
   /** e.g. "date,asc" */
   sort?: string;
+  /**
+   * Ticketmaster's events endpoint has no price parameter, so these are
+   * applied to the events it returns rather than to the query. An event with
+   * no published price range is kept: absent isn't the same as too expensive.
+   */
+  minPrice?: number;
+  maxPrice?: number;
 };
 
 export class TicketmasterApiError extends Error {
@@ -125,6 +149,13 @@ export async function searchConcerts(
   if (params.city) searchParams.set("city", params.city);
   if (params.stateCode) searchParams.set("stateCode", params.stateCode);
   if (params.postalCode) searchParams.set("postalCode", params.postalCode);
+  if (params.countryCode) searchParams.set("countryCode", params.countryCode);
+  if (params.geoPoint) searchParams.set("geoPoint", params.geoPoint);
+  // Ticketmaster only honours radius alongside geoPoint or postalCode.
+  if (params.radius !== undefined && (params.geoPoint || params.postalCode)) {
+    searchParams.set("radius", String(params.radius));
+    searchParams.set("unit", params.unit ?? "miles");
+  }
   // TEA-30: normalize free-text keyword so e.g. "Jazz" and "jazz " build
   // the exact same request URL, and therefore share one Data Cache entry.
   // city/stateCode/postalCode aren't touched here - the route already
@@ -175,7 +206,31 @@ export async function searchConcerts(
   const data = (await response.json()) as TmEventsResponse;
   const events = data._embedded?.events ?? [];
 
-  return events.map(normalizeEvent);
+  return events
+    .map(normalizeEvent)
+    .filter((concert) => matchesPrice(concert, params));
+}
+
+/**
+ * Applies a price ceiling/floor Ticketmaster itself can't filter on.
+ *
+ * An event matches when its published range overlaps the requested one, so a
+ * $30-$150 show still counts as "under $60" - there are seats at that price.
+ * Events with no published range are kept rather than guessed at.
+ */
+function matchesPrice(
+  concert: NormalizedConcert,
+  { minPrice, maxPrice }: TicketmasterSearchParams
+): boolean {
+  if (minPrice === undefined && maxPrice === undefined) return true;
+
+  const range = concert.priceRange;
+  if (!range) return true;
+
+  if (maxPrice !== undefined && range.min > maxPrice) return false;
+  if (minPrice !== undefined && range.max < minPrice) return false;
+
+  return true;
 }
 
 function normalizeEvent(event: TmEvent): NormalizedConcert {
