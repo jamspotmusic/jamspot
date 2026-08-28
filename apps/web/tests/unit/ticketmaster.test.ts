@@ -257,3 +257,112 @@ test("searchConcerts opts the request into Next's Data Cache with the configured
     revalidate: 1800,
   });
 });
+test("searchConcerts sends a geolocated search as geoPoint plus a radius", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestedUrl = "";
+  globalThis.fetch = async (url: RequestInfo | URL) => {
+    requestedUrl = String(url);
+    return jsonResponse({ _embedded: { events: [] } });
+  };
+
+  try {
+    await withEnv("TICKETMASTER_API_KEY", "key-123", async () => {
+      await searchConcerts({
+        geoPoint: "9q9p1dhfd",
+        radius: 50,
+        unit: "miles",
+        classificationName: "Jazz,Folk,Alternative",
+      });
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  // geoPoint, not the deprecated latlong.
+  assert.match(requestedUrl, /geoPoint=9q9p1dhfd/);
+  assert.doesNotMatch(requestedUrl, /latlong=/);
+  assert.match(requestedUrl, /radius=50/);
+  assert.match(requestedUrl, /unit=miles/);
+  // Genres replace the "music" default so the search is their union, not
+  // every music event.
+  assert.match(requestedUrl, /classificationName=Jazz%2CFolk%2CAlternative/);
+});
+
+test("searchConcerts drops a radius Ticketmaster would ignore", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestedUrl = "";
+  globalThis.fetch = async (url: RequestInfo | URL) => {
+    requestedUrl = String(url);
+    return jsonResponse({ _embedded: { events: [] } });
+  };
+
+  try {
+    await withEnv("TICKETMASTER_API_KEY", "key-123", async () => {
+      // Radius only applies alongside geoPoint or postalCode.
+      await searchConcerts({ city: "Oakland", radius: 25 });
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.doesNotMatch(requestedUrl, /radius=/);
+  assert.doesNotMatch(requestedUrl, /unit=/);
+});
+
+test("searchConcerts applies the price bounds Ticketmaster cannot filter on", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    jsonResponse({
+      _embedded: {
+        events: [
+          // Entirely under the ceiling.
+          { id: "cheap", name: "Cheap", priceRanges: [{ min: 20, max: 45, currency: "USD" }] },
+          // Overlaps it - there are seats under $60.
+          { id: "overlap", name: "Overlap", priceRanges: [{ min: 30, max: 150, currency: "USD" }] },
+          // Entirely above it.
+          { id: "pricey", name: "Pricey", priceRanges: [{ min: 200, max: 400, currency: "USD" }] },
+          // No published range: absent isn't the same as too expensive.
+          { id: "unpriced", name: "Unpriced" },
+        ],
+      },
+    });
+
+  let result: NormalizedConcert[] = [];
+  try {
+    await withEnv("TICKETMASTER_API_KEY", "key-123", async () => {
+      result = await searchConcerts({ city: "Oakland", maxPrice: 60 });
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.deepEqual(result.map((concert) => concert.id), [
+    "cheap",
+    "overlap",
+    "unpriced",
+  ]);
+});
+
+test("searchConcerts applies a price floor the same way", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    jsonResponse({
+      _embedded: {
+        events: [
+          { id: "cheap", name: "Cheap", priceRanges: [{ min: 20, max: 45, currency: "USD" }] },
+          { id: "pricey", name: "Pricey", priceRanges: [{ min: 200, max: 400, currency: "USD" }] },
+        ],
+      },
+    });
+
+  let result: NormalizedConcert[] = [];
+  try {
+    await withEnv("TICKETMASTER_API_KEY", "key-123", async () => {
+      result = await searchConcerts({ city: "Oakland", minPrice: 100 });
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.deepEqual(result.map((concert) => concert.id), ["pricey"]);
+});
