@@ -4,6 +4,41 @@ All notable changes to JamSpot are documented in this file.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-01
+
+### Changed
+
+- Swapped the mobile app's two tabs so its information architecture matches the web app's. Web's `/` is concert discovery and Reviews is the single secondary page its nav links to; mobile had the inverse, with reviews on the Home tab and concerts on Explore. `apps/mobile/src/app/index.tsx` is now the concert search and `apps/mobile/src/app/reviews.tsx` the reviews list, and the tab bar reads Home / Reviews.
+- Pinned the mobile app to the dark theme instead of following the device's appearance setting, and set `userInterfaceStyle` to `dark` in `app.json`. The web app has no light/dark toggle - the dark violet palette in `apps/web/app/globals.css` is the only theme it ever renders - so following the system setting could only ever diverge from it.
+- Rebuilt the mobile concert card and details modal against their web counterparts: the image gradient fade into the card body, the bordered genre badge, the dimmed cover image, the tinted "Get Tickets" button, and the modal's bordered `PRICE` / `ABOUT` / `LISTEN` sections with a pulsing bio placeholder in place of a "Loading bio…" line.
+- Replaced the mobile streaming links' text pills with the branded artwork web uses: Apple's hosted, unmodified "Listen on Apple Music" badge and the black Spotify pill. The Spotify mark was extracted from the base64 PNG embedded in `apps/web/public/streaming/spotify-icon.svg` so React Native can render it without an SVG loader.
+- Matched the mobile Reviews screen to apps/web/app/reviews-page/page.tsx's layout: the review body reserves seven lines the way web's `min-h-[7lh]` does, so a one-line review no longer collapses the card into a stub; card spacing, list padding, and the gap under the heading row follow web's `space-y-4` / `p-6` / `space-y-6`; the nav pill sits beside the wordmark rather than pushed to the far edge; the result count stays visible while loading; and the footer is gone, since web renders one on `/` only. Search also stops matching the review body, matching web, where a query only ever tests the event metadata.
+- Rebuilt the mobile review card with the same four bands web's has - rating and date, a bordered event-info block, the clamped body with a Show more/less toggle, and a footer carrying the author and the two vote buttons. Votes are presentational on both clients, but where web seeds its counts from mock data, mobile's start at zero: the live `reviews` rows have no vote columns to read.
+- Event metadata on mobile (dates, times, prices, genre chips, result counts) now renders in the platform monospace face, matching the `'DM Mono', monospace` web sets on the same text. Neither app loads DM Sans, DM Mono, or Unbounded as a webfont, so both fall back to platform defaults.
+- Changed the mobile splash background from Expo blue to `#07070f`, the app background, so the splash hands off to the first screen without a colour flash.
+
+### Added
+
+- The hero state on the mobile Home tab: the same photograph, both gradient overlays, and the "Find your next Jam" headline web shows until the first search has been submitted.
+- Skeleton cards on both mobile tabs while a search or the reviews list is loading, reproducing Tailwind's `animate-pulse`, in place of the spinner they showed before.
+- The "Upcoming Shows" / genre-name results heading and the event count beside it on the mobile Home tab, and the matching "Reviews" heading and review count on the Reviews tab.
+- "Show more" pagination on mobile - six cards, then six more per press - matching web's `initialLimit`/`itemsPerLoad`.
+- Web's `completeCardEvents` filter on mobile, as `isCompleteCardEvent` in `apps/mobile/src/lib/concerts.ts`, so a partially populated Ticketmaster record is dropped rather than drawn as a card with holes in it.
+- The footer from the bottom of web's landing page - dimmed brand mark and copyright line above a top border - on the mobile Home tab. Reviews doesn't get one, matching web, where `/reviews-page` renders header and main only.
+- Genre pre-selection on mobile search, matching web: a query that names one of the genres already on screen lands on that genre's chip rather than on "All".
+
+### Fixed
+
+- The prod-preview deploy workflow built against a second, separate Vercel project (`VERCEL_PROJECT_ID_K7PZ`) rather than the one subprod uses, so the two aliases had independent environment-variable stores. `jamspot-k7pz.vercel.app` was serving a build whose `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` Supabase rejected, returning `502 Failed to fetch reviews: Invalid API key`, while subprod and the production domain were fine. Both workflows now resolve `VERCEL_PROJECT_ID` to the same project and pull the same `preview` environment scope.
+- The mobile app required `npm run dev:web` to show anything at all. A dev build committed to `http://<your-machine>:3000` purely because Metro was attached, so working on the app without also running the web app produced "Could not reach the JamSpot API" on every screen. The local dev server is now a preference rather than a prerequisite: the app probes it once per session and falls through to the deployed API when nothing answers. The probe requires a JamSpot-shaped response - a success, or the app's own `{ error }` body - so an unrelated service holding port 3000 is ignored instead of being mistaken for the API.
+- Release builds of the mobile app had no reachable backend. `getApiBaseUrl` fell back to `http://localhost:3000` whenever Metro's hostUri was absent, which is exactly the case in a TestFlight, Play, or standalone build - so a shipped app resolved to the handset it was running on, where nothing is listening, over a cleartext scheme iOS App Transport Security blocks anyway. `getApiBaseUrl` now takes the local dev server only in a `__DEV__` build with Metro attached and a dev server answering; everything else falls through to production at `https://www.jamspotmusic.app`, configurable per build via `extra.apiUrl` in `app.json`. `EXPO_PUBLIC_API_URL` still overrides everything, so preprod remains testable from both dev and release builds; `apps/mobile/README.md` documents the full resolution order.
+- `/api/reviews` and `/api/concerts` failed on mobile whenever anything else already held port 3000. `npm run dev:web` ran a bare `next dev`, which silently falls back to the next free port, while the mobile client hardcodes `:3000` - so it kept querying whatever else was listening there and surfaced that service's 404 as a JamSpot error. The dev server now binds `${PORT:-3000}`, so it fails loudly on a busy port instead of drifting, and honours `PORT` when you do want it somewhere else (pair it with `EXPO_PUBLIC_API_URL` on the mobile side).
+- Mobile API errors now name the full URL rather than just the path, so a response from something that isn't the JamSpot API is identifiable from the message alone, and the "Is `npm run dev:web` running?" hint is limited to the case where the app is actually pointed at a local dev server.
+- The review card's invisible line-measuring copy of the body text was announced by screen readers on the Expo web build, so every review was read out twice. It carried `accessibilityElementsHidden` and `importantForAccessibility`, neither of which react-native-web maps to anything; it now also carries `aria-hidden`.
+- The mobile Spotify pill and "Get Tickets" button rendered unstyled. `ExternalLink` wraps an expo-router `Link`, and cloning the child with `asChild` drops that child's own `style` prop; both now carry their styling on an inner `View` the clone can't reach.
+- The mobile concert search showed "No shows found. Try a different search." whenever matches existed but none of them passed the completeness filter. Web keys that message off the filtered count and renders an empty grid in that case, which mobile now does too.
+- Replaced the leftover Expo starter branding in the Expo web build's nav bar ("Expo Starter" and a link to the Expo docs) with the JamSpot mark and the app's own two destinations, and moved the bar into the layout flow so screen content no longer renders underneath it.
+
 ## [0.4.0] - 2026-08-25
 
 ### Added
