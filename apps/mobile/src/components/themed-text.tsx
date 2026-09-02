@@ -4,7 +4,20 @@ import { Fonts, ThemeColor } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 
 export type ThemedTextProps = TextProps & {
-  type?: 'default' | 'title' | 'small' | 'smallBold' | 'subtitle' | 'link' | 'linkPrimary' | 'code';
+  type?:
+    | 'default'
+    | 'title'
+    | 'small'
+    | 'smallBold'
+    | 'subtitle'
+    | 'link'
+    | 'linkPrimary'
+    | 'code'
+    | 'display'
+    | 'heading'
+    | 'mono'
+    | 'monoSmall'
+    | 'monoTiny';
   themeColor?: ThemeColor;
 };
 
@@ -23,6 +36,11 @@ export function ThemedText({ style, type = 'default', themeColor, ...rest }: The
         type === 'link' && styles.link,
         type === 'linkPrimary' && styles.linkPrimary,
         type === 'code' && styles.code,
+        type === 'display' && styles.display,
+        type === 'heading' && styles.heading,
+        type === 'mono' && styles.mono,
+        type === 'monoSmall' && styles.monoSmall,
+        type === 'monoTiny' && styles.monoTiny,
         style,
       ]}
       {...rest}
@@ -69,5 +87,44 @@ const styles = StyleSheet.create({
     fontFamily: Fonts.mono,
     fontWeight: Platform.select({ android: 700 }) ?? 500,
     fontSize: 12,
+  },
+  /**
+   * The web app's hero headline: `text-4xl lg:text-6xl uppercase` with
+   * `leading-none tracking-tight` (apps/web/app/page.tsx).
+   */
+  display: {
+    fontSize: 36,
+    lineHeight: 38,
+    fontWeight: 800,
+    letterSpacing: -0.5,
+  },
+  /**
+   * Section headings — web renders these at a flat 1rem/bold regardless of
+   * the `text-lg` class, because of the inline `fontSize: "1rem"` override.
+   */
+  heading: {
+    fontSize: 16,
+    lineHeight: 22,
+    fontWeight: 800,
+  },
+  // Web sets `fontFamily: "'DM Mono', monospace"` on every piece of event
+  // metadata — dates, times, prices, genre chips, result counts. Neither
+  // app loads DM Sans/DM Mono/Unbounded as a webfont, so both fall back to
+  // the platform's default sans and monospace faces; using Fonts.mono here
+  // reproduces what the browser actually renders.
+  mono: {
+    fontFamily: Fonts.mono,
+    fontSize: 14,
+    lineHeight: 20,
+  },
+  monoSmall: {
+    fontFamily: Fonts.mono,
+    fontSize: 12,
+    lineHeight: 16,
+  },
+  monoTiny: {
+    fontFamily: Fonts.mono,
+    fontSize: 10,
+    lineHeight: 14,
   },
 });
