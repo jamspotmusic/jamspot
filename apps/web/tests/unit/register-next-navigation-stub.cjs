@@ -9,7 +9,20 @@ const originalLoad = Module._load;
 
 Module._load = function load(request, parent, isMain) {
   if (request === "next/navigation") {
-    return { __esModule: true, usePathname: () => "/" };
+    return {
+      __esModule: true,
+      usePathname: () => "/",
+      // AuthNav calls router.refresh() after signing out so Server Components
+      // re-render without the session. No-ops are enough for static rendering.
+      useRouter: () => ({
+        refresh() {},
+        push() {},
+        replace() {},
+        back() {},
+        forward() {},
+        prefetch() {},
+      }),
+    };
   }
 
   return originalLoad.call(this, request, parent, isMain);

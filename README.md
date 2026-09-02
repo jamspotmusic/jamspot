@@ -388,6 +388,99 @@ The temporary connection-test route and database table should be removed after t
 
 ---
 
+## Authentication (passwordless email OTP)
+
+Both apps sign in against the **same Supabase project**, so they share one Auth
+user population: an account created by emailing a code on the phone signs in on
+the web with the same address, and vice versa.
+
+Authentication is **optional**. Concert search and reviews are fully usable
+signed out — there are no route guards, no redirects, and no middleware. Signing
+in only adds a header affordance ("Sign in" on web, a Sign in button on mobile).
+
+### How the flow works
+
+There are no passwords anywhere in the system. `signInWithPassword`, password
+signup, and password reset are deliberately not implemented.
+
+1. The user enters an email address.
+2. The app calls `supabase.auth.signInWithOtp({ email })`.
+3. The UI moves to a code-entry step.
+4. The user types the 8-digit code from the email.
+5. The app calls `supabase.auth.verifyOtp({ email, token, type: "email" })`.
+6. A successful verification creates a Supabase session.
+7. The session persists — across reload on web, across app restart on mobile.
+8. Signing out clears the local session and returns the UI to signed out.
+
+The same address is signed up on first use and signed in thereafter, so there is
+no separate registration screen.
+
+### Where the code lives
+
+| Concern | Location |
+| --- | --- |
+| Flow, validation, error wording | `packages/shared/src/index.ts` |
+| Web browser client (cookies) | `apps/web/lib/supabase-browser.ts` |
+| Web server client (Server Components) | `apps/web/lib/supabase-server.ts` |
+| Web auth state | `apps/web/components/AuthProvider.tsx` |
+| Web UI | `apps/web/components/SignInForm.tsx`, `SignInPanel.tsx`, `AuthNav.tsx`, `app/sign-in/page.tsx` |
+| Mobile client (AsyncStorage) | `apps/mobile/src/lib/supabase.ts` |
+| Mobile auth state | `apps/mobile/src/hooks/use-auth.tsx` |
+| Mobile UI | `apps/mobile/src/components/auth-modal.tsx`, `auth-button.tsx` |
+
+The two apps deliberately have **separate client implementations** because their
+session handling differs: web writes the session to cookies via `@supabase/ssr`
+so Server Components can read it, while React Native has no cookie jar and
+persists to AsyncStorage instead. What *is* shared is the framework-agnostic
+part — the OTP flow, input validation, and user-facing error messages — which
+lives in `@jamspot/shared` and takes the client's `auth` object as a parameter
+rather than importing one. No instantiated Supabase client is shared.
+
+### Environment variables
+
+Web (`apps/web/.env.local`, template at `apps/web/.env.example`):
+
+```env
+NEXT_PUBLIC_SUPABASE_URL=
+NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=
+```
+
+Mobile (`apps/mobile/.env`, template at `apps/mobile/.env.example`):
+
+```env
+EXPO_PUBLIC_SUPABASE_URL=
+EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY=
+```
+
+Point both at the same project. Values come from the Supabase dashboard under
+**Project Settings → Data API**.
+
+Only the project URL and the publishable (anon) key belong in either app.
+`NEXT_PUBLIC_*` is inlined into the browser bundle and `EXPO_PUBLIC_*` is
+embedded in the app binary, so both are readable by anyone. A service-role key,
+database password, or JWT secret must never appear in either. Client-side checks
+are for UX only — **Row Level Security is what actually protects data**, and it
+governs these clients exactly as it governs an anonymous one.
+
+### Dependencies this added
+
+| Package | Workspace | Why |
+| --- | --- | --- |
+| `@supabase/ssr` | `apps/web` | Cookie-based sessions readable by Next.js Server Components. Replaces the deprecated `@supabase/auth-helpers-nextjs`, which is not used. |
+| `@supabase/supabase-js` | `apps/mobile` | The mobile app previously reached the API only over `fetch` and had no Supabase client. |
+| `@react-native-async-storage/async-storage` | `apps/mobile` | Session persistence across app restarts. No storage dependency existed in the repo; this is Supabase's recommended React Native option, installed via `npx expo install` for an SDK-compatible version. |
+
+### Running the auth tests
+
+```bash
+npm run test:web
+```
+
+The OTP flow is tested against a fake `auth` object, so no test sends a real
+email or touches the network. See `apps/web/tests/unit/auth.test.ts`.
+
+---
+
 ## Environment Variable Strategy
 
 JamSpot currently uses three separate environments.
