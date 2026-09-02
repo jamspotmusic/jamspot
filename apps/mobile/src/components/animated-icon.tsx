@@ -140,7 +140,10 @@ const styles = StyleSheet.create({
   },
   splashOverlay: {
     ...StyleSheet.absoluteFill,
-    backgroundColor: '#208AEF',
+    // Matches app.json's splash backgroundColor and the app background
+    // (--background in apps/web/app/globals.css), so the splash hands off
+    // to the first screen without a colour flash.
+    backgroundColor: '#07070f',
     alignItems: 'center',
     justifyContent: 'center',
     zIndex: 1000,

@@ -25,6 +25,58 @@ In the output, you'll find options to open the app in a
 
 You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
 
+## Which API the app talks to
+
+The web app's routes under `/api` are the backend for both clients. `getApiBaseUrl`
+in `src/lib/api.ts` resolves the host in descending order of specificity:
+
+| Order | Condition | Resolves to |
+| --- | --- | --- |
+| 1 | `EXPO_PUBLIC_API_URL` is set | that value |
+| 2 | dev build **and** a JamSpot dev server answers on `:3000` | `http://<your-machine>:3000` |
+| 3 | anything else | `extra.apiUrl` in `app.json`, else production |
+
+Case 2 is a preference, not a requirement: **the app does not need `npm run dev:web`
+to run.** On startup it probes the local dev server once, and falls through to the
+deployed API if nothing JamSpot-shaped answers. Start the dev server and reload to
+pick it back up.
+
+The probe checks that the response is actually JamSpot's — a success, or its
+`{ error }` body shape — rather than just "something responded". Port 3000 attracts
+squatters, and accepting a stray 404 from an unrelated service is how the app ends
+up rendering someone else's error.
+
+Production is `https://www.jamspotmusic.app` (Vercel behind Cloudflare). The `www`
+host is deliberate: the apex 308-redirects there, and `fetch` follows it, but that
+costs a round trip on every request.
+
+**Local development.** Run `npm run dev:web` from the repo root if you want the app
+talking to your local API — case 2 picks up your machine's LAN address from Metro, so
+simulators, emulators, and physical devices on the same network all reach it. Skip it
+and the app runs against the deployed API instead. The dev server binds port 3000 and
+fails loudly if something already holds it, because the mobile client looks for that
+port specifically. To move it, set `PORT` on both sides:
+
+```bash
+PORT=3007 npm run dev:web
+EXPO_PUBLIC_API_URL=http://localhost:3007 npm run dev:mobile
+```
+
+**Testing against a deployed environment.** `EXPO_PUBLIC_API_URL` overrides
+everything, in dev builds and release builds alike:
+
+```bash
+# preprod / subprod
+EXPO_PUBLIC_API_URL=https://jamspot-three.vercel.app npm run dev:mobile
+
+# production, from a dev build
+EXPO_PUBLIC_API_URL=https://www.jamspotmusic.app npm run dev:mobile
+```
+
+For a distributable build aimed at preprod (EAS internal distribution, say), set
+the same variable at build time, or point `extra.apiUrl` in `app.json` at the
+environment that build should ship against.
+
 ## Get a fresh project
 
 When you're ready, run:
