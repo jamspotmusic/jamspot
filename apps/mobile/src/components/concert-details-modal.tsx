@@ -4,9 +4,11 @@ import { useEffect, useState } from 'react';
 import { Modal, Platform, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 
 import { ExternalLink } from '@/components/external-link';
+import { CardImageGradient, GradientOverlay } from '@/components/gradient-overlay';
+import { SkeletonBar } from '@/components/skeleton';
 import { StreamingLinks } from '@/components/streaming-links';
 import { ThemedText } from '@/components/themed-text';
-import { Spacing } from '@/constants/theme';
+import { Radius, Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import {
   getAppleMusicArtist,
@@ -28,6 +30,7 @@ type FetchState<T> = {
 
 const initialFetchState = <T,>(): FetchState<T> => ({ data: null, isLoading: true, error: null });
 
+/** The mobile twin of apps/web/app/page.tsx's `EventDetailsModal`. */
 export function ConcertDetailsModal({ event, onClose }: { event: CardEvent; onClose: () => void }) {
   const theme = useTheme();
   const [isBioExpanded, setIsBioExpanded] = useState(false);
@@ -50,7 +53,11 @@ export function ConcertDetailsModal({ event, onClose }: { event: CardEvent; onCl
       })
       .catch((err) => {
         if (!cancelled) {
-          setBio({ data: null, isLoading: false, error: describeError(err, 'Failed to load artist bio') });
+          setBio({
+            data: null,
+            isLoading: false,
+            error: describeError(err, 'Failed to load artist bio'),
+          });
         }
       });
 
@@ -93,34 +100,47 @@ export function ConcertDetailsModal({ event, onClose }: { event: CardEvent; onCl
       animationType="slide"
       presentationStyle={Platform.OS === 'ios' ? 'pageSheet' : undefined}
       onRequestClose={onClose}>
-      <ScrollView style={{ backgroundColor: theme.card }} contentContainerStyle={{ flexGrow: 1 }}>
+      <ScrollView style={{ backgroundColor: theme.card }} contentContainerStyle={styles.scroll}>
         <View style={styles.imageWrapper}>
-          <Image source={{ uri: event.image }} style={styles.image} contentFit="cover" />
-          <Pressable onPress={onClose} style={styles.closeButton} accessibilityLabel="Close concert details">
+          <Image
+            source={{ uri: event.image }}
+            style={styles.image}
+            contentFit="cover"
+            transition={200}
+            accessibilityLabel={event.artist}
+          />
+          <GradientOverlay direction="to top" stops={CardImageGradient} />
+
+          <Pressable
+            onPress={onClose}
+            accessibilityRole="button"
+            accessibilityLabel="Close concert details"
+            style={({ pressed }) => [styles.closeButton, pressed && styles.pressed]}>
             <X size={18} color="#ffffff" />
           </Pressable>
+
           <View style={styles.imageOverlay}>
-            <ThemedText type="small" style={styles.genreOverlayText}>
-              {event.genre}
-            </ThemedText>
-            <ThemedText type="title" style={styles.titleOverlayText}>
-              {event.artist}
-            </ThemedText>
+            <View style={styles.genreBadge}>
+              <ThemedText type="monoSmall" style={styles.genreBadgeText}>
+                {event.genre}
+              </ThemedText>
+            </View>
+            <ThemedText style={styles.titleOverlayText}>{event.artist}</ThemedText>
           </View>
         </View>
 
         <View style={styles.content}>
           <View style={styles.metaRow}>
             <Calendar size={16} color={theme.primary} />
-            <ThemedText>{event.date}</ThemedText>
+            <ThemedText type="small">{event.date}</ThemedText>
           </View>
           <View style={styles.metaRow}>
             <Clock size={16} color={theme.primary} />
-            <ThemedText>{event.time}</ThemedText>
+            <ThemedText type="small">{event.time}</ThemedText>
           </View>
           <View style={styles.metaRow}>
             <MapPin size={16} color={theme.primary} />
-            <ThemedText themeColor="textSecondary">
+            <ThemedText type="small">
               {event.venue}
               {'\n'}
               {event.city}, {event.state}
@@ -129,52 +149,72 @@ export function ConcertDetailsModal({ event, onClose }: { event: CardEvent; onCl
 
           {event.priceRange && (
             <Section title="Price">
-              <ThemedText>{event.priceRange}</ThemedText>
+              <ThemedText style={styles.price}>{event.priceRange}</ThemedText>
             </Section>
           )}
 
           <Section title={`About ${event.artist}`}>
             {bio.isLoading ? (
-              <ThemedText type="small" themeColor="textSecondary">
-                Loading bio…
+              <View style={styles.bioSkeleton}>
+                <SkeletonBar height={12} width="100%" />
+                <SkeletonBar height={12} width="100%" />
+                <SkeletonBar height={12} width="66%" />
+              </View>
+            ) : bio.error ? (
+              <ThemedText type="small" themeColor="textSecondary" style={styles.bioText}>
+                Bio unavailable right now.
               </ThemedText>
             ) : bio.data?.summary ? (
               <View>
                 <ThemedText
                   type="small"
                   themeColor="textSecondary"
+                  style={styles.bioText}
                   numberOfLines={isBioExpanded ? undefined : 5}>
                   {bio.data.summary}
                 </ThemedText>
-                <Pressable onPress={() => setIsBioExpanded((prev) => !prev)}>
-                  <ThemedText type="link" style={styles.readMore}>
+                <Pressable
+                  onPress={() => setIsBioExpanded((prev) => !prev)}
+                  accessibilityRole="button">
+                  <ThemedText type="small" style={[styles.readMore, { color: theme.primary }]}>
                     {isBioExpanded ? 'Show less' : 'Read more'}
                   </ThemedText>
                 </Pressable>
               </View>
             ) : (
-              <ThemedText type="small" themeColor="textSecondary">
-                {bio.error ? 'Bio unavailable right now.' : 'No biography found for this artist.'}
+              <ThemedText type="small" themeColor="textSecondary" style={styles.bioText}>
+                No biography found for this artist.
               </ThemedText>
             )}
           </Section>
 
           <Section title="Listen">
             <StreamingLinks
+              artistName={artistName}
               spotify={{ url: spotify.data?.url ?? null, isLoading: spotify.isLoading }}
               appleMusic={{ url: appleMusic.data?.url ?? null, isLoading: appleMusic.isLoading }}
             />
           </Section>
 
           {event.ticketUrl && (
+            // Styling lives on the inner View: `asChild` clones the
+            // Pressable and drops its own `style` prop.
             <ExternalLink href={event.ticketUrl as `${string}:${string}`} asChild>
-              <Pressable>
-                <View style={[styles.ticketButton, { backgroundColor: theme.primary }]}>
-                  <Ticket size={16} color={theme.primaryForeground} />
-                  <ThemedText style={[styles.ticketButtonText, { color: theme.primaryForeground }]}>
-                    Get Tickets
-                  </ThemedText>
-                </View>
+              <Pressable accessibilityRole="link">
+                {({ pressed }) => (
+                  <View
+                    style={[
+                      styles.ticketButton,
+                      { backgroundColor: theme.primary },
+                      pressed && styles.pressed,
+                    ]}>
+                    <Ticket size={16} color={theme.primaryForeground} />
+                    <ThemedText
+                      style={[styles.ticketButtonText, { color: theme.primaryForeground }]}>
+                      Get Tickets
+                    </ThemedText>
+                  </View>
+                )}
               </Pressable>
             </ExternalLink>
           )}
@@ -184,10 +224,13 @@ export function ConcertDetailsModal({ event, onClose }: { event: CardEvent; onCl
   );
 }
 
+/** Web's `border-t border-border pt-4` blocks with a mono uppercase label. */
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
+  const theme = useTheme();
+
   return (
-    <View style={styles.section}>
-      <ThemedText type="small" themeColor="textSecondary" style={styles.sectionTitle}>
+    <View style={[styles.section, { borderTopColor: theme.border }]}>
+      <ThemedText type="monoSmall" themeColor="textSecondary" style={styles.sectionTitle}>
         {title.toUpperCase()}
       </ThemedText>
       {children}
@@ -200,8 +243,12 @@ function describeError(err: unknown, fallback: string) {
 }
 
 const styles = StyleSheet.create({
+  scroll: {
+    flexGrow: 1,
+  },
   imageWrapper: {
-    height: 240,
+    // web: `h-56`
+    height: 224,
   },
   image: {
     width: '100%',
@@ -211,10 +258,10 @@ const styles = StyleSheet.create({
     position: 'absolute',
     top: Spacing.three,
     right: Spacing.three,
-    backgroundColor: 'rgba(0,0,0,0.5)',
-    borderRadius: 999,
-    width: 32,
-    height: 32,
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+    borderRadius: Radius.pill,
+    width: 34,
+    height: 34,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -223,18 +270,26 @@ const styles = StyleSheet.create({
     bottom: Spacing.three,
     left: Spacing.three,
     right: Spacing.three,
+    alignItems: 'flex-start',
   },
-  genreOverlayText: {
+  genreBadge: {
+    backgroundColor: 'rgba(0, 0, 0, 0.6)',
+    borderRadius: Radius.badge,
+    paddingHorizontal: Spacing.two,
+    paddingVertical: Spacing.one,
+  },
+  genreBadgeText: {
     color: '#ffffff',
-    opacity: 0.8,
   },
   titleOverlayText: {
+    marginTop: Spacing.two,
     color: '#ffffff',
-    fontSize: 28,
-    lineHeight: 32,
+    fontSize: 24,
+    lineHeight: 30,
+    fontWeight: '900',
   },
   content: {
-    padding: Spacing.four,
+    padding: Spacing.three,
     gap: Spacing.two,
   },
   metaRow: {
@@ -242,26 +297,40 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: Spacing.two,
   },
+  price: {
+    fontWeight: '600',
+  },
   section: {
-    marginTop: Spacing.three,
+    marginTop: Spacing.two,
+    paddingTop: Spacing.three,
+    borderTopWidth: StyleSheet.hairlineWidth,
     gap: Spacing.two,
   },
   sectionTitle: {
     letterSpacing: 0.5,
   },
+  bioSkeleton: {
+    gap: Spacing.two,
+  },
+  bioText: {
+    lineHeight: 24,
+  },
   readMore: {
-    marginTop: Spacing.one,
+    marginTop: Spacing.two,
   },
   ticketButton: {
-    marginTop: Spacing.four,
+    marginTop: Spacing.three,
     flexDirection: 'row',
     gap: Spacing.two,
-    borderRadius: Spacing.two,
-    paddingVertical: Spacing.three,
+    borderRadius: Radius.control,
+    paddingVertical: Spacing.three - Spacing.one,
     alignItems: 'center',
     justifyContent: 'center',
   },
   ticketButtonText: {
     fontWeight: '600',
+  },
+  pressed: {
+    opacity: 0.7,
   },
 });

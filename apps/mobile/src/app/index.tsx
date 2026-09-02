@@ -1,114 +1,339 @@
-import { Search } from 'lucide-react-native';
+import { MapPin, Music2, Search } from 'lucide-react-native';
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { ActivityIndicator, FlatList, RefreshControl, StyleSheet, TextInput, View } from 'react-native';
+import {
+  FlatList,
+  Pressable,
+  RefreshControl,
+  ScrollView,
+  StyleSheet,
+  View,
+} from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { openBrowserAsync } from 'expo-web-browser';
 
 import { BrandHeader } from '@/components/brand-header';
-import { ReviewCard } from '@/components/review-card';
+import { ConcertCard } from '@/components/concert-card';
+import { ConcertCardSkeleton } from '@/components/concert-card-skeleton';
+import { ConcertDetailsModal } from '@/components/concert-details-modal';
+import { Hero } from '@/components/hero';
+import { SearchField } from '@/components/search-field';
+import { SiteFooter } from '@/components/site-footer';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
-import { BottomTabInset, Spacing } from '@/constants/theme';
+import {
+  BottomTabInset,
+  CardsPerLoad,
+  InitialCardLimit,
+  Radius,
+  Spacing,
+} from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
-import { ApiError, getReviews, type Review } from '@/lib/api';
+import { ApiError } from '@/lib/api';
+import {
+  buildConcertSearchParams,
+  filterCardEvents,
+  isCompleteCardEvent,
+  searchConcerts,
+  toCardEvent,
+  type CardEvent,
+} from '@/lib/concerts';
 
 function describeError(err: unknown) {
-  return err instanceof ApiError ? err.message : 'Something went wrong loading reviews.';
+  return err instanceof ApiError ? err.message : 'Failed to load concerts.';
 }
 
-function filterReviews(reviews: Review[], query: string) {
-  const normalized = query.trim().toLowerCase();
-  if (!normalized) return reviews;
-  return reviews.filter((review) =>
-    [review.short_description, review.description, review.location]
-      .join(' ')
-      .toLowerCase()
-      .includes(normalized),
-  );
-}
-
+/**
+ * The mobile twin of apps/web/app/page.tsx: the hero until a search has been
+ * submitted, then genre chips, a result count, and the paged card list.
+ */
 export default function HomeScreen() {
-  const [reviews, setReviews] = useState<Review[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [keywordInput, setKeywordInput] = useState('');
+  const [locationInput, setLocationInput] = useState('');
+  const [keyword, setKeyword] = useState('');
+  const [location, setLocation] = useState('');
+  const [hasSearched, setHasSearched] = useState(false);
+  const [activeGenre, setActiveGenre] = useState('All');
+  const [visibleCount, setVisibleCount] = useState(InitialCardLimit);
+
+  const [events, setEvents] = useState<CardEvent[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const [fetchError, setFetchError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
-  const [query, setQuery] = useState('');
+  const [selectedEvent, setSelectedEvent] = useState<CardEvent | null>(null);
+
   const theme = useTheme();
 
+  // Fetches whenever a search is submitted. Only ever sets state inside
+  // .then()/.catch() (never synchronously in the effect body) to satisfy
+  // this project's react-hooks/set-state-in-effect rule.
   useEffect(() => {
+    if (!hasSearched) return;
+    if (!keyword && !location) return;
+
     let cancelled = false;
-    getReviews()
-      .then((data) => {
+    searchConcerts(buildConcertSearchParams(keyword, location))
+      .then((concerts) => {
         if (!cancelled) {
-          setReviews(data);
-          setError(null);
+          setEvents(concerts.map(toCardEvent));
+          setIsLoading(false);
         }
       })
       .catch((err) => {
-        if (!cancelled) setError(describeError(err));
+        if (!cancelled) {
+          setFetchError(describeError(err));
+          setEvents([]);
+          setIsLoading(false);
+        }
       });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [hasSearched, keyword, location]);
+
+  // Genres available, derived from the fetched events so the chips only ever
+  // show options that actually have results.
+  const genres = useMemo(
+    () => ['All', ...new Set(events.map((e) => e.genre).filter(Boolean))],
+    [events],
+  );
+
+  const handleSearch = useCallback(() => {
+    const query = keywordInput.trim();
+    const loc = locationInput.trim();
+
+    setKeyword(query);
+    setLocation(loc);
+    setHasSearched(true);
+    setVisibleCount(InitialCardLimit);
+    setIsLoading(true);
+    setFetchError(null);
+
+    // Web pre-selects a genre chip when the query names one of the genres
+    // it already knows about, so "jazz" lands on the Jazz filter.
+    const matchedGenre = genres.find(
+      (genre) => genre !== 'All' && query.toLowerCase().includes(genre.toLowerCase()),
+    );
+    setActiveGenre(matchedGenre ?? 'All');
+  }, [genres, keywordInput, locationInput]);
 
   const onRefresh = useCallback(async () => {
+    if (!keyword && !location) return;
     setRefreshing(true);
     try {
-      setReviews(await getReviews());
-      setError(null);
+      const concerts = await searchConcerts(buildConcertSearchParams(keyword, location));
+      setEvents(concerts.map(toCardEvent));
+      setFetchError(null);
     } catch (err) {
-      setError(describeError(err));
+      setFetchError(describeError(err));
     }
     setRefreshing(false);
+  }, [keyword, location]);
+
+  const handleTicketPress = useCallback((event: CardEvent) => {
+    if (!event.ticketUrl) return;
+    openBrowserAsync(event.ticketUrl);
   }, []);
 
-  const filtered = useMemo(() => (reviews ? filterReviews(reviews, query) : []), [reviews, query]);
+  const handleGenrePress = useCallback((genre: string) => {
+    setActiveGenre(genre);
+    setVisibleCount(InitialCardLimit);
+  }, []);
+
+  const handleLoadMore = useCallback(() => {
+    setIsLoadingMore(true);
+    // Future API pagination here — for now the extra cards are already
+    // in memory, same as web.
+    setVisibleCount((prev) => prev + CardsPerLoad);
+    setIsLoadingMore(false);
+  }, []);
+
+  const filtered = useMemo(
+    () => filterCardEvents(events, keyword, location, activeGenre),
+    [events, keyword, location, activeGenre],
+  );
+
+  // Web only renders cards it can fill in completely, so a half-populated
+  // Ticketmaster record never shows up as a card with holes in it.
+  const visibleCards = useMemo(
+    () => filtered.slice(0, visibleCount).filter(isCompleteCardEvent),
+    [filtered, visibleCount],
+  );
+
+  const showResults = hasSearched && !isLoading && !fetchError;
 
   return (
     <ThemedView style={styles.container}>
-      <SafeAreaView style={styles.safeArea}>
-        <BrandHeader />
-
-        <ThemedText type="title" style={styles.title}>
-          Reviews
-        </ThemedText>
-
-        {reviews && (
-          <View style={[styles.inputRow, { backgroundColor: theme.backgroundElement, borderColor: theme.border }]}>
-            <Search size={16} color={theme.textSecondary} />
-            <TextInput
-              value={query}
-              onChangeText={setQuery}
-              placeholder="Search by artist, venue, or location..."
-              placeholderTextColor={theme.textSecondary}
-              style={[styles.input, { color: theme.text }]}
+      <SafeAreaView edges={['top']} style={styles.safeArea}>
+        <View style={styles.headerBar}>
+          <BrandHeader />
+          <View style={styles.searchRow}>
+            <SearchField
+              icon={Search}
+              value={keywordInput}
+              onChangeText={setKeywordInput}
+              onSubmitEditing={handleSearch}
+              placeholder="Artist, venue, event, or genre..."
             />
-          </View>
-        )}
-
-        {error && (
-          <ThemedView type="backgroundElement" style={styles.errorBox}>
-            <ThemedText type="small">{error}</ThemedText>
-          </ThemedView>
-        )}
-
-        {!reviews && !error && <ActivityIndicator style={styles.loading} />}
-
-        {reviews && (
-          <FlatList
-            data={filtered}
-            keyExtractor={(review) => review.id}
-            renderItem={({ item }) => <ReviewCard review={item} />}
-            contentContainerStyle={styles.list}
-            refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
-            ListEmptyComponent={
-              <ThemedText type="small" themeColor="textSecondary">
-                {query ? 'No reviews match your search.' : 'No reviews yet.'}
+            <SearchField
+              icon={MapPin}
+              value={locationInput}
+              onChangeText={setLocationInput}
+              onSubmitEditing={handleSearch}
+              placeholder="City or state"
+            />
+            <Pressable
+              onPress={handleSearch}
+              accessibilityRole="button"
+              style={({ pressed }) => [
+                styles.searchButton,
+                { backgroundColor: theme.primary },
+                pressed && styles.pressed,
+              ]}>
+              <ThemedText style={[styles.searchButtonText, { color: theme.primaryForeground }]}>
+                Search
               </ThemedText>
+            </Pressable>
+          </View>
+        </View>
+
+        {!hasSearched ? (
+          <ScrollView contentContainerStyle={styles.heroScroll}>
+            <Hero />
+            <View style={styles.gutter}>
+              <SiteFooter />
+            </View>
+          </ScrollView>
+        ) : (
+          <FlatList
+            data={showResults ? visibleCards : []}
+            keyExtractor={(event) => event.id}
+            renderItem={({ item }) => (
+              <ConcertCard
+                event={item}
+                onPress={setSelectedEvent}
+                onTicketPress={handleTicketPress}
+              />
+            )}
+            ItemSeparatorComponent={() => <View style={styles.cardSeparator} />}
+            contentContainerStyle={styles.listContent}
+            refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
+            ListHeaderComponent={
+              showResults && events.length > 0 ? (
+                <View style={styles.resultsHeader}>
+                  <View style={styles.genreRow}>
+                    {genres.map((genre) => {
+                      const active = activeGenre === genre;
+                      return (
+                        <Pressable
+                          key={genre}
+                          onPress={() => handleGenrePress(genre)}
+                          accessibilityRole="button"
+                          accessibilityState={{ selected: active }}
+                          style={({ pressed }) => [
+                            styles.genreChip,
+                            {
+                              backgroundColor: active ? theme.primary : theme.backgroundElement,
+                              borderColor: active ? theme.primary : theme.border,
+                            },
+                            pressed && styles.pressed,
+                          ]}>
+                          <ThemedText
+                            type="monoSmall"
+                            style={active ? { color: theme.primaryForeground } : undefined}
+                            themeColor={active ? undefined : 'textSecondary'}>
+                            {genre}
+                          </ThemedText>
+                        </Pressable>
+                      );
+                    })}
+                  </View>
+
+                  <View style={styles.resultsTitleRow}>
+                    <ThemedText type="heading">
+                      {activeGenre === 'All' ? 'Upcoming Shows' : activeGenre}
+                    </ThemedText>
+                    <ThemedText type="mono" themeColor="textSecondary">
+                      {filtered.length} event{filtered.length !== 1 ? 's' : ''}
+                    </ThemedText>
+                  </View>
+                </View>
+              ) : null
+            }
+            ListEmptyComponent={
+              isLoading ? (
+                <View style={styles.skeletonList}>
+                  {Array.from({ length: InitialCardLimit }).map((_, index) => (
+                    <ConcertCardSkeleton key={index} />
+                  ))}
+                </View>
+              ) : fetchError ? (
+                <EmptyState message={fetchError} />
+              ) : filtered.length === 0 ? (
+                <EmptyState message="No shows found. Try a different search." />
+              ) : (
+                // Matches are in hand but none of them survived
+                // isCompleteCardEvent. Web renders an empty grid here rather
+                // than the "no shows" message, since it keys that message off
+                // the filtered count too.
+                null
+              )
+            }
+            ListFooterComponent={
+              <View>
+                {isLoadingMore && (
+                  <View style={styles.skeletonList}>
+                    <ConcertCardSkeleton />
+                  </View>
+                )}
+                {showResults && visibleCount < filtered.length && (
+                  <View style={styles.loadMoreRow}>
+                    <Pressable
+                      onPress={handleLoadMore}
+                      disabled={isLoadingMore}
+                      accessibilityRole="button"
+                      style={({ pressed }) => [
+                        styles.loadMoreButton,
+                        {
+                          backgroundColor: pressed ? theme.primary : theme.backgroundElement,
+                          borderColor: pressed ? theme.primary : 'rgba(139, 92, 246, 0.4)',
+                        },
+                      ]}>
+                      <ThemedText type="small">
+                        {isLoadingMore ? 'Loading...' : 'Show more'}
+                      </ThemedText>
+                    </Pressable>
+                  </View>
+                )}
+                <SiteFooter />
+              </View>
             }
           />
         )}
       </SafeAreaView>
+
+      {selectedEvent && (
+        <ConcertDetailsModal
+          key={selectedEvent.id}
+          event={selectedEvent}
+          onClose={() => setSelectedEvent(null)}
+        />
+      )}
     </ThemedView>
+  );
+}
+
+/** Web's centred Music2 glyph over a one-line message. */
+function EmptyState({ message }: { message: string }) {
+  const theme = useTheme();
+
+  return (
+    <View style={styles.emptyState}>
+      <Music2 size={40} color={theme.textSecondary} style={styles.emptyIcon} />
+      <ThemedText type="small" themeColor="textSecondary" style={styles.emptyText}>
+        {message}
+      </ThemedText>
+    </View>
   );
 }
 
@@ -118,35 +343,84 @@ const styles = StyleSheet.create({
   },
   safeArea: {
     flex: 1,
-    paddingHorizontal: Spacing.four,
+  },
+  headerBar: {
+    paddingHorizontal: Spacing.three,
+    paddingBottom: Spacing.three,
+    gap: Spacing.two,
+  },
+  searchRow: {
+    gap: Spacing.two,
+  },
+  searchButton: {
+    borderRadius: Radius.control,
+    paddingVertical: Spacing.two + Spacing.half,
+    alignItems: 'center',
+  },
+  searchButtonText: {
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  gutter: {
+    paddingHorizontal: Spacing.three,
+  },
+  heroScroll: {
+    paddingBottom: BottomTabInset + Spacing.three,
+  },
+  listContent: {
+    paddingHorizontal: Spacing.three,
+    paddingBottom: BottomTabInset + Spacing.three,
+  },
+  resultsHeader: {
+    paddingTop: Spacing.three,
+    paddingBottom: Spacing.three,
     gap: Spacing.three,
   },
-  inputRow: {
+  genreRow: {
     flexDirection: 'row',
-    alignItems: 'center',
+    flexWrap: 'wrap',
     gap: Spacing.two,
-    borderRadius: Spacing.two,
+  },
+  genreChip: {
+    borderRadius: Radius.pill,
     borderWidth: StyleSheet.hairlineWidth,
     paddingHorizontal: Spacing.three,
-    paddingVertical: Spacing.two,
+    paddingVertical: Spacing.one + Spacing.half,
   },
-  input: {
-    flex: 1,
-    fontSize: 16,
+  resultsTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    justifyContent: 'space-between',
   },
-  title: {
-    fontSize: 32,
-    lineHeight: 38,
+  cardSeparator: {
+    height: Spacing.two + Spacing.one,
   },
-  loading: {
-    marginTop: Spacing.six,
+  skeletonList: {
+    gap: Spacing.two + Spacing.one,
+    paddingTop: Spacing.three,
   },
-  errorBox: {
-    borderRadius: Spacing.three,
-    padding: Spacing.three,
+  loadMoreRow: {
+    marginTop: Spacing.four,
+    alignItems: 'center',
   },
-  list: {
+  loadMoreButton: {
+    borderRadius: Radius.pill,
+    borderWidth: StyleSheet.hairlineWidth,
+    paddingHorizontal: Spacing.four,
+    paddingVertical: Spacing.two + Spacing.half,
+  },
+  emptyState: {
+    alignItems: 'center',
+    paddingVertical: Spacing.six,
     gap: Spacing.three,
-    paddingBottom: BottomTabInset + Spacing.three,
+  },
+  emptyIcon: {
+    opacity: 0.4,
+  },
+  emptyText: {
+    textAlign: 'center',
+  },
+  pressed: {
+    opacity: 0.7,
   },
 });

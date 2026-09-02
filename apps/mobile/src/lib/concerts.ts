@@ -128,6 +128,25 @@ export function toCardEvent(concert: NormalizedConcert): CardEvent {
   };
 }
 
+/**
+ * Web only renders a card once every field it draws is populated
+ * (apps/web/app/page.tsx's `completeCardEvents`), so a partially populated
+ * Ticketmaster record is dropped rather than shown with blanks in it.
+ */
+export function isCompleteCardEvent(event: CardEvent): boolean {
+  return Boolean(
+    event.id &&
+      event.artist &&
+      event.venue &&
+      event.city &&
+      event.state &&
+      event.date &&
+      event.time &&
+      event.genre &&
+      event.image,
+  );
+}
+
 export function filterCardEvents(
   events: CardEvent[],
   search: string,

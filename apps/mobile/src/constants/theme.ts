@@ -43,6 +43,19 @@ export const ReviewColors = {
   foreground: '#111827',
   muted: '#6b7280',
   border: '#e5e7eb',
+  // The Tailwind palette entries ReviewCard.tsx names directly, rather than
+  // through a --review-* token: the star fills, the "Show more" link, and
+  // the two vote-button states.
+  star: '#facc15',
+  starEmpty: '#d1d5db',
+  ratingLabel: '#4b5563',
+  link: '#2563eb',
+  upvoteBorder: '#22c55e',
+  upvoteBackground: '#f0fdf4',
+  upvoteForeground: '#16a34a',
+  downvoteBorder: '#ef4444',
+  downvoteBackground: '#fef2f2',
+  downvoteForeground: '#dc2626',
 } as const;
 
 export const Fonts = Platform.select({
@@ -80,5 +93,23 @@ export const Spacing = {
   six: 64,
 } as const;
 
+/**
+ * Tailwind's radius scale, which is what apps/web sizes every corner with:
+ * `rounded` (4), `rounded-md` (6), `rounded-lg` (8), `rounded-xl` (12),
+ * `rounded-2xl` (16), `rounded-full`.
+ */
+export const Radius = {
+  badge: 4,
+  mark: 6,
+  control: 8,
+  card: 12,
+  sheet: 16,
+  pill: 999,
+} as const;
+
 export const BottomTabInset = Platform.select({ ios: 50, android: 80 }) ?? 0;
 export const MaxContentWidth = 800;
+
+/** Web renders at most 6 cards, then 6 more per "Show more" press. */
+export const InitialCardLimit = 6;
+export const CardsPerLoad = 6;
