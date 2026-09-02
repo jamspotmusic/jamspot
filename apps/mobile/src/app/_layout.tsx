@@ -4,6 +4,7 @@ import { StatusBar } from 'expo-status-bar';
 
 import { AnimatedSplashOverlay } from '@/components/animated-icon';
 import AppTabs from '@/components/app-tabs';
+import { AuthProvider } from '@/hooks/use-auth';
 
 SplashScreen.preventAutoHideAsync();
 
@@ -17,7 +18,9 @@ export default function TabLayout() {
     <ThemeProvider value={DarkTheme}>
       <StatusBar style="light" />
       <AnimatedSplashOverlay />
-      <AppTabs />
+      <AuthProvider>
+        <AppTabs />
+      </AuthProvider>
     </ThemeProvider>
   );
 }

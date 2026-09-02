@@ -12,6 +12,7 @@ import type { NormalizedArtistBio } from "@/lib/lastfm";
 import type { NormalizedSpotifyArtist } from "@/lib/spotify";
 import type { NormalizedAppleMusicArtist } from "@/lib/apple-music";
 import StreamingServiceLinks from "../components/StreamingServiceLinks";
+import AuthNav from "../components/AuthNav";
 
 const FALLBACK_IMAGE = "https://picsum.photos/400/250?random=1";
 
@@ -351,6 +352,8 @@ export default function Home() {
               />
             </div>
           </form>
+
+          <AuthNav />
         </div>
       </header>
 

@@ -21,6 +21,7 @@
     "app/test-concert-query/page.tsx",
     "components/ConcertModal.tsx",
     "components/StreamingServiceLinks.tsx",
+    "components/SignInForm.tsx",
     "tests/unit/**/*.ts"
   ],
   "exclude": [

@@ -5,6 +5,7 @@ import Link from "next/link";
 import { Music2, Search } from "lucide-react";
 import ReviewCard from "@/components/ReviewCard";
 import ReviewCardSkeleton from "@/components/ReviewCardSkeleton";
+import AuthNav from "@/components/AuthNav";
 
 export const mockReviews = [
   {
@@ -165,6 +166,8 @@ export default function ReviewsPage() {
                                     Reviews
                                 </Link>
                             </nav>
+
+                            <AuthNav />
                         </div>
                         
                         {/* Search */}
