@@ -462,13 +462,6 @@ export default function Home() {
               {filtered.length} event{filtered.length !== 1 ? "s" : ""}
             </span>
           </div>
-            <span
-              className="text-sm text-muted-foreground"
-              style={{ fontFamily: "'DM Mono', monospace" }}
-            >
-              {filtered.length} event{filtered.length !== 1 ? "s" : ""}
-            </span>
-          </div>
 
           {/* TEA-47: Luna's read of the query, when the search came from it. */}
           {lunaInterpretation && (
