@@ -396,3 +396,242 @@ export async function signOut(auth: OtpAuthClient): Promise<AuthResult> {
     };
   }
 }
+
+
+// ---------------------------------------------------------------------------
+// Luna natural-language concert search (TEA-47)
+// ---------------------------------------------------------------------------
+//
+// Both apps send a natural-language query to the same `concert-query` Supabase
+// Edge Function and feed its structured output into the same /api/concerts
+// route, so the interpretation flow, the location-retry handshake, and the
+// user-facing error wording all belong in one place.
+//
+// What deliberately does NOT live here, following the same split as the auth
+// helpers above: the Supabase client and the device-location API. Web invokes
+// through a cookie-backed browser client and geolocates via
+// navigator.geolocation; mobile invokes through an AsyncStorage-backed client
+// and geolocates via expo-location. Both are passed in as parameters, typed
+// structurally, so this module stays free of @supabase/supabase-js and of any
+// browser-only or React-Native-only API — and every function here is testable
+// against plain fakes.
+
+/** Ticketmaster-compatible params the Edge Function emits. Mirrors
+ *  `toTicketmasterParams` in supabase/functions/concert-query/handler.ts. */
+export type TicketmasterParams = {
+  keyword?: string;
+  classificationName?: string;
+  city?: string;
+  stateCode?: string;
+  postalCode?: string;
+  countryCode?: string;
+  geoPoint?: string;
+  radius?: number;
+  unit?: "miles";
+  startDateTime?: string;
+  endDateTime?: string;
+  sort?: string;
+};
+
+/** Ticketmaster has no price parameter, so JamSpot applies these itself. */
+export type ConcertPriceFilter = {
+  minPrice?: number;
+  maxPrice?: number;
+  currency: "USD";
+};
+
+/** How the Edge Function decided where to search. */
+export type LocationSource =
+  | "query"
+  | "device"
+  | "caller-place"
+  | "ip"
+  | "nationwide";
+
+export type ConcertQueryResponse = {
+  query: string;
+  interpretation?: string;
+  ticketmasterParams: TicketmasterParams;
+  filters?: ConcertPriceFilter;
+  meta?: {
+    model?: string;
+    timeZone?: string;
+    currentDateTime?: string;
+    locationSource?: LocationSource;
+  };
+};
+
+/** Device coordinates, however the platform obtained them. */
+export type DeviceLocation = {
+  latitude: number;
+  longitude: number;
+};
+
+/** Extra field sent on the retry, once we know where (or whether) we can locate. */
+export type ConcertQueryRetry =
+  | { location: DeviceLocation }
+  | { geolocationDenied: true };
+
+export type ConcertQueryBody = {
+  query: string;
+  timeZone: string;
+} & Partial<{ location: DeviceLocation; geolocationDenied: true }>;
+
+/**
+ * The one thing each platform supplies: a call to the Edge Function. Typed as
+ * supabase-js's `functions.invoke` result so both apps can pass a thin wrapper
+ * around their own client.
+ */
+export type ConcertQueryInvoker = (
+  body: ConcertQueryBody,
+) => Promise<{ data: unknown; error: unknown }>;
+
+/**
+ * Resolves device coordinates, or null when the platform can't or the user
+ * declines. Web wraps navigator.geolocation; mobile wraps expo-location.
+ */
+export type DeviceLocationProvider = () => Promise<DeviceLocation | null>;
+
+const CONCERT_QUERY_FAILURE = "Concert query failed.";
+const INVALID_RESPONSE =
+  "Concert query returned an invalid response.";
+
+/**
+ * Pull the message and machine-readable code out of whatever the Edge
+ * Function invocation threw.
+ *
+ * Matched on `error.name` rather than `instanceof`, so this needs no
+ * dependency on @supabase/supabase-js — the same structural approach the auth
+ * helpers above take. `FunctionsHttpError` carries the response as `context`,
+ * and the function's own `{ error, code }` body is inside it; the other two
+ * classes have fixed messages and no body worth reading.
+ */
+export async function describeConcertQueryError(
+  error: unknown,
+): Promise<{ message: string; code?: string }> {
+  if (!error) return { message: CONCERT_QUERY_FAILURE };
+
+  const candidate = error as {
+    name?: string;
+    message?: string;
+    context?: { json?: () => Promise<unknown> };
+  };
+
+  if (candidate.name === "FunctionsHttpError" && candidate.context?.json) {
+    try {
+      const payload = (await candidate.context.json()) as {
+        error?: unknown;
+        code?: unknown;
+      };
+
+      if (typeof payload?.error === "string") {
+        return {
+          message: payload.error,
+          code: typeof payload.code === "string" ? payload.code : undefined,
+        };
+      }
+    } catch {
+      // Body wasn't JSON. Fall through to the error's own message.
+    }
+  }
+
+  if (candidate.name === "FunctionsRelayError") {
+    return {
+      message: `Supabase relay error: ${candidate.message ?? "unknown"}`,
+    };
+  }
+
+  if (candidate.name === "FunctionsFetchError") {
+    return {
+      message: `Unable to reach the concert query service: ${
+        candidate.message ?? "unknown"
+      }`,
+    };
+  }
+
+  if (typeof candidate.message === "string" && candidate.message) {
+    return { message: candidate.message };
+  }
+
+  return { message: CONCERT_QUERY_FAILURE };
+}
+
+/**
+ * Turn a natural-language query into Ticketmaster search parameters.
+ *
+ * The first call deliberately carries no location: a query that names a city
+ * needs none, and the Edge Function never learns where the user is unless it
+ * asks. Only when it answers `location_required` do we ask the platform for
+ * coordinates and try again — and if that comes back empty (permission
+ * refused, unsupported, timed out), the retry says so and the function widens
+ * to a nationwide search rather than leaving the user at a dead end.
+ *
+ * Throws an Error carrying a user-facing message; callers surface it directly.
+ */
+export async function interpretConcertQuery(
+  invoke: ConcertQueryInvoker,
+  query: string,
+  timeZone: string,
+  requestDeviceLocation: DeviceLocationProvider,
+): Promise<ConcertQueryResponse> {
+  async function call(extra?: ConcertQueryRetry) {
+    const { data, error } = await invoke({ query, timeZone, ...extra });
+    if (error) throw error;
+    return data;
+  }
+
+  let data: unknown;
+
+  try {
+    data = await call();
+  } catch (error) {
+    const { message, code } = await describeConcertQueryError(error);
+
+    if (code !== "location_required") {
+      throw new Error(message);
+    }
+
+    const location = await requestDeviceLocation();
+
+    try {
+      data = await call(location ? { location } : { geolocationDenied: true });
+    } catch (retryError) {
+      // The retry's own failure is what the user needs to see - typically
+      // `anchor_required`, which asks for an artist, genre, or place.
+      throw new Error((await describeConcertQueryError(retryError)).message);
+    }
+  }
+
+  if (!data || typeof data !== "object" || !("ticketmasterParams" in data)) {
+    throw new Error(INVALID_RESPONSE);
+  }
+
+  return data as ConcertQueryResponse;
+}
+
+/**
+ * Serialize the Edge Function's output into a query string for
+ * /api/concerts, dropping anything empty. The route accepts these param
+ * names verbatim, including the geolocated form (geoPoint + radius) and the
+ * price bounds Ticketmaster itself can't filter on.
+ */
+export function buildConcertsQuery(
+  params: TicketmasterParams,
+  filters?: ConcertPriceFilter,
+): string {
+  const search = new URLSearchParams();
+
+  const entries: Record<string, unknown> = {
+    ...params,
+    ...(filters?.minPrice !== undefined ? { minPrice: filters.minPrice } : {}),
+    ...(filters?.maxPrice !== undefined ? { maxPrice: filters.maxPrice } : {}),
+  };
+
+  for (const [key, value] of Object.entries(entries)) {
+    if (value !== undefined && value !== null && value !== "") {
+      search.set(key, String(value));
+    }
+  }
+
+  return search.toString();
+}

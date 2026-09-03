@@ -13,6 +13,7 @@ import type { NormalizedSpotifyArtist } from "@/lib/spotify";
 import type { NormalizedAppleMusicArtist } from "@/lib/apple-music";
 import StreamingServiceLinks from "../components/StreamingServiceLinks";
 import AuthNav from "../components/AuthNav";
+import LunaSearch from "@/components/LunaSearch";
 
 const FALLBACK_IMAGE = "https://picsum.photos/400/250?random=1";
 
@@ -187,6 +188,15 @@ export default function Home() {
   const itemsPerLoad = 6;
 
   const [visibleCount, setVisibleCount] = useState(initialLimit);
+   // Luna's one-line description of the search it built (TEA-47), shown above
+  // the results so the user can see how their words were read.
+  //
+  // Declared last on purpose: tests/unit/home-hooks.test.cjs drives this
+  // component with a positional useState stub, so appending here leaves every
+  // existing hook index untouched.
+  const [lunaInterpretation, setLunaInterpretation] = useState<string | null>(
+    null,
+  );
 
   // Genres available, derived from the fetched events so the chips only
   // ever show options that actually have results. Ticketmaster searches
@@ -247,6 +257,7 @@ export default function Home() {
 
     setHasSearched(true);
     setVisibleCount(initialLimit);
+    setLunaInterpretation(null);
 
     const matchedGenre = genres.find(
       (genre) => 
@@ -375,13 +386,42 @@ export default function Home() {
           <div className="absolute inset-0 bg-gradient-to-t from-background via-background/60 to-transparent" />
           <div className="absolute inset-0 bg-gradient-to-r from-background/90 via-transparent to-transparent" />
 
-          <div className="relative flex h-full items-center justify-center px-6 lg:px-12">
+                    <div className="relative flex h-full flex-col items-center justify-center gap-8 px-6 lg:px-12">
             <h1
-              className="leading-none tracking-tight text-white text-4xl lg:text-6xl uppercase"
+              className="leading-none tracking-tight text-white text-4xl lg:text-6xl uppercase text-center"
               style={{ fontFamily: "'Unbounded', sans-serif" }}
             >
               Find your next Jam
             </h1>
+
+            {/* TEA-47: natural-language search via the concert-query Supabase
+                Edge Function. Feeds the same /api/concerts route and the same
+                card grid the keyword search above uses - it only ever calls
+                Home's existing setters, and never touches OpenAI directly. */}
+            <LunaSearch
+              onSearchStart={(interpretation) => {
+                setFetchError(null);
+                setEvents([]);
+                setSearchInput("");
+                setSearch("");
+                setLocationInput("");
+                setLocation("");
+                setActiveGenre("All");
+                setVisibleCount(initialLimit);
+                setLunaInterpretation(interpretation ?? null);
+                setHasSearched(true);
+                setIsLoading(true);
+              }}
+              onSearchSuccess={(concerts) => {
+                setEvents(concerts.map(toCardEvent));
+                setIsLoading(false);
+              }}
+              onSearchError={(message) => {
+                setFetchError(message);
+                setEvents([]);
+                setIsLoading(false);
+              }}
+            />
           </div>
         </section>
       ) : (
@@ -422,6 +462,20 @@ export default function Home() {
               {filtered.length} event{filtered.length !== 1 ? "s" : ""}
             </span>
           </div>
+            <span
+              className="text-sm text-muted-foreground"
+              style={{ fontFamily: "'DM Mono', monospace" }}
+            >
+              {filtered.length} event{filtered.length !== 1 ? "s" : ""}
+            </span>
+          </div>
+
+          {/* TEA-47: Luna's read of the query, when the search came from it. */}
+          {lunaInterpretation && (
+            <p className="-mt-3 mb-6 text-sm text-muted-foreground">
+              {lunaInterpretation}
+            </p>
+          )}
 
           {/* Events grid */}
           {isLoading ? (

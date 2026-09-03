@@ -92,6 +92,10 @@ function homeState(overrides = {}) {
     overrides.isLoading ?? false,
     overrides.fetchError ?? null,
     overrides.visibleCount ?? 6,
+    // Order matters: this array is consumed positionally by the useState
+    // stub, so it must track the order the hooks appear in app/page.tsx.
+    // lunaInterpretation (TEA-47) is declared last there, after visibleCount.
+    overrides.lunaInterpretation ?? null,
   ];
 }
 
