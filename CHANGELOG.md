@@ -4,6 +4,19 @@ All notable changes to JamSpot are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Passwordless email-OTP authentication across both apps, against one shared Supabase project so the web and mobile clients have a single Auth user population. The user enters an email, `signInWithOtp` sends an 8-digit code, and `verifyOtp` with `type: "email"` exchanges it for a session — no passwords, no `signInWithPassword`, no reset flow. Sessions survive reload on web and app restart on mobile, and signing out clears the local session.
+- Auth is optional and additive: concert search and reviews remain fully usable signed out, with no route guards, redirects, or middleware. The only new affordance is a header control — `AuthNav` on web, `AuthButton` opening a sheet on mobile.
+- The framework-agnostic half of the flow — request, verify, sign out, email/code validation, and the user-facing wording for invalid email, failed send, invalid code, expired code, rate limiting, and network failure — in `@jamspot/shared`. It takes the client's `auth` object as a parameter rather than importing one, so no instantiated Supabase client is shared and the package stays free of browser-only and React-Native-only APIs.
+- Separate Supabase clients per platform, because their session handling genuinely differs: `apps/web/lib/supabase-browser.ts` and `supabase-server.ts` use `@supabase/ssr` so cookies carry the session into Server Components, while `apps/mobile/src/lib/supabase.ts` persists to AsyncStorage with `persistSession`, `autoRefreshToken`, `detectSessionInUrl: false`, and `AppState`-driven refresh start/stop. The deprecated `@supabase/auth-helpers-nextjs` packages are not used.
+- `apps/web/.env.example` and `apps/mobile/.env.example`, and 21 unit tests covering the flow against a fake auth client so no test sends a real email.
+
+### Fixed
+
+- A stray `.env*` rule in `.gitignore` re-ignored `.env.example` after the earlier `!.env.example` whitelist, which would have made the new templates uncommittable. The negation is re-asserted after it rather than removing the rule.
+
+
 ## [0.5.0] - 2026-09-01
 
 ### Changed

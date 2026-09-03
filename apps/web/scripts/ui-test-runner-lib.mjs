@@ -9,6 +9,7 @@ export const REQUIRE_FLAGS = [
   "--require=./tests/unit/register-module-alias.cjs",
   "--require=./tests/unit/register-next-image-stub.cjs",
   "--require=./tests/unit/register-next-navigation-stub.cjs",
+  "--require=./tests/unit/register-auth-stub.cjs",
 ];
 
 /** Every compiled *.test.ts under tests/unit, plus the hand-written *.test.cjs files. */
@@ -46,6 +47,8 @@ export function coverageIncludes() {
     path.join(BUILD_DIR, "app", "test-concert-query", "page.js"),
     path.join(BUILD_DIR, "components", "ConcertModal.js"),
     path.join(BUILD_DIR, "components", "StreamingServiceLinks.js"),
+    path.join(BUILD_DIR, "components", "SignInForm.js"),
+    path.join(BUILD_DIR, "components", "LunaSearch.js"),
     ...compiledJsFiles(path.join(BUILD_DIR, "lib")),
     ...compiledJsFiles(path.join(BUILD_DIR, "app", "api")),
   ];
