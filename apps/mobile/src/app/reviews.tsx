@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { FlatList, RefreshControl, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import { AuthButton } from '@/components/auth-button';
 import { BrandHeader } from '@/components/brand-header';
 import { ReviewCard } from '@/components/review-card';
 import { ReviewCardSkeleton } from '@/components/review-card-skeleton';
@@ -81,10 +82,13 @@ export default function ReviewsScreen() {
               tab bar already does that here, so the header carries just the
               brand and the search field. */}
           <BrandHeader>
-            <View style={[styles.navPill, { backgroundColor: theme.primary }]}>
-              <ThemedText type="small" style={{ color: theme.primaryForeground }}>
-                Reviews
-              </ThemedText>
+            <View style={styles.navGroup}>
+              <View style={[styles.navPill, { backgroundColor: theme.primary }]}>
+                <ThemedText type="small" style={{ color: theme.primaryForeground }}>
+                  Reviews
+                </ThemedText>
+              </View>
+              <AuthButton />
             </View>
           </BrandHeader>
 
@@ -143,6 +147,11 @@ const styles = StyleSheet.create({
   headerBar: {
     paddingHorizontal: Spacing.three,
     paddingBottom: Spacing.three,
+    gap: Spacing.two,
+  },
+  navGroup: {
+    flexDirection: 'row',
+    alignItems: 'center',
     gap: Spacing.two,
   },
   navPill: {
