@@ -22,6 +22,7 @@
     "components/ConcertModal.tsx",
     "components/StreamingServiceLinks.tsx",
     "components/SignInForm.tsx",
+    "components/LunaSearch.tsx",
     "tests/unit/**/*.ts"
   ],
   "exclude": [
