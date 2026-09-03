@@ -11,6 +11,7 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { openBrowserAsync } from 'expo-web-browser';
 
+import { AuthButton } from '@/components/auth-button';
 import { BrandHeader } from '@/components/brand-header';
 import { ConcertCard } from '@/components/concert-card';
 import { ConcertCardSkeleton } from '@/components/concert-card-skeleton';
@@ -166,7 +167,9 @@ export default function HomeScreen() {
     <ThemedView style={styles.container}>
       <SafeAreaView edges={['top']} style={styles.safeArea}>
         <View style={styles.headerBar}>
-          <BrandHeader />
+          <BrandHeader>
+            <AuthButton />
+          </BrandHeader>
           <View style={styles.searchRow}>
             <SearchField
               icon={Search}
