@@ -12,6 +12,7 @@ import type { NormalizedArtistBio } from "@/lib/lastfm";
 import type { NormalizedSpotifyArtist } from "@/lib/spotify";
 import type { NormalizedAppleMusicArtist } from "@/lib/apple-music";
 import StreamingServiceLinks from "../components/StreamingServiceLinks";
+import LunaSearch from "@/components/LunaSearch";
 
 const FALLBACK_IMAGE = "https://picsum.photos/400/250?random=1";
 
@@ -372,13 +373,41 @@ export default function Home() {
           <div className="absolute inset-0 bg-gradient-to-t from-background via-background/60 to-transparent" />
           <div className="absolute inset-0 bg-gradient-to-r from-background/90 via-transparent to-transparent" />
 
-          <div className="relative flex h-full items-center justify-center px-6 lg:px-12">
+                    <div className="relative flex h-full flex-col items-center justify-center gap-8 px-6 lg:px-12">
             <h1
-              className="leading-none tracking-tight text-white text-4xl lg:text-6xl uppercase"
+              className="leading-none tracking-tight text-white text-4xl lg:text-6xl uppercase text-center"
               style={{ fontFamily: "'Unbounded', sans-serif" }}
             >
               Find your next Jam
             </h1>
+
+            {/* Luna: natural-language search, backed by the concert-query
+                Supabase Edge Function. Reuses the same /api/concerts route
+                and result pipeline as the structured search above - it only
+                ever calls Home's existing setters, never OpenAI directly. */}
+            <LunaSearch
+              onSearchStart={() => {
+                setFetchError(null);
+                setEvents([]);
+                setSearchInput("");
+                setSearch("");
+                setLocationInput("");
+                setLocation("");
+                setActiveGenre("All");
+                setVisibleCount(initialLimit);
+                setHasSearched(true);
+                setIsLoading(true);
+              }}
+              onSearchSuccess={(concerts) => {
+                setEvents(concerts.map(toCardEvent));
+                setIsLoading(false);
+              }}
+              onSearchError={(message) => {
+                setFetchError(message);
+                setEvents([]);
+                setIsLoading(false);
+              }}
+            />
           </div>
         </section>
       ) : (
