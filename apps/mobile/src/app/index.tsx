@@ -184,8 +184,6 @@ export default function HomeScreen() {
 
   const filtered = useMemo(
     () => filterCardEvents(events, keyword, location, activeGenre),
-  const filtered = useMemo(
-    () => filterCardEvents(events, keyword, location, activeGenre),
     [events, keyword, location, activeGenre],
   );
 
@@ -210,10 +208,6 @@ export default function HomeScreen() {
             onSearchSuccess={handleLunaSuccess}
             onSearchError={handleLunaError}
           />
-
-          <View style={styles.searchRow}>
-            <SearchField
-              icon={Search}
           <View style={styles.searchRow}>
             <SearchField
               icon={Search}
