@@ -48,6 +48,7 @@ export function coverageIncludes() {
     path.join(BUILD_DIR, "components", "ConcertModal.js"),
     path.join(BUILD_DIR, "components", "StreamingServiceLinks.js"),
     path.join(BUILD_DIR, "components", "SignInForm.js"),
+    path.join(BUILD_DIR, "components", "LunaSearch.js"),
     ...compiledJsFiles(path.join(BUILD_DIR, "lib")),
     ...compiledJsFiles(path.join(BUILD_DIR, "app", "api")),
   ];
