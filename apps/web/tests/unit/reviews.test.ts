@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { supabase } from "../../lib/supabase";
 import { getReviews, getReviewById, createReview, ReviewsError, type NewReview } from "../../lib/reviews";
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -12,19 +13,35 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+/** A row in the shape the live `reviews` table actually returns. */
+function reviewRow(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "1",
+    short_description: "Massive Attack at Golden 1 Center",
+    description: "Amazing performance, the visuals were incredible.",
+    star_rating: 4,
+    location: "Golden 1 Center, Sacramento, CA",
+    review_date: "2026-07-30",
+    created_at: "2026-07-31T00:00:00Z",
+    updated_at: "2026-07-31T00:00:00Z",
+    author_id: "author-1",
+    profiles: null,
+    ...overrides,
+  };
+}
+
 test("getReviews returns rows ordered most-recent-first", async () => {
   const originalFetch = globalThis.fetch;
   let requestedUrl = "";
   globalThis.fetch = async (url: RequestInfo | URL) => {
     requestedUrl = String(url);
-    return jsonResponse([
-      { id: "1", musician: "Nova Bloom", venue: "The Granada", concert_date: "2026-05-01", review_text: "Great show", venue_city: null, venue_state: null, venue_country: null, user_name: null, created_at: "2026-05-02T00:00:00Z" },
-    ]);
+    return jsonResponse([reviewRow()]);
   };
   try {
     const reviews = await getReviews();
     assert.equal(reviews.length, 1);
-    assert.equal(reviews[0].musician, "Nova Bloom");
+    assert.equal(reviews[0].short_description, "Massive Attack at Golden 1 Center");
+    assert.equal(reviews[0].star_rating, 4);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -55,10 +72,21 @@ test("getReviews throws a ReviewsError on failure", async () => {
   }
 });
 
-test("getReviewById returns the matching review", async () => {
+test("getReviews carries the embedded author through", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () =>
-    jsonResponse({ id: "1", musician: "Nova Bloom", venue: "The Granada", concert_date: "2026-05-01", review_text: "Great show", venue_city: null, venue_state: null, venue_country: null, user_name: null, created_at: "2026-05-02T00:00:00Z" });
+    jsonResponse([reviewRow({ profiles: { id: "author-1", username: "sarah" } })]);
+  try {
+    const reviews = await getReviews();
+    assert.equal(reviews[0].profiles?.username, "sarah");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("getReviewById returns the matching review", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => jsonResponse(reviewRow());
   try {
     const review = await getReviewById("1");
     assert.equal(review?.id, "1");
@@ -91,94 +119,66 @@ test("getReviewById throws a ReviewsError on failure", async () => {
   }
 });
 
-test("createReview inserts a row and returns the created record", async () => {
+const newReview: NewReview = {
+  shortDescription: "Massive Attack at Golden 1 Center",
+  description: "Amazing performance, the visuals were incredible.",
+  starRating: 4,
+  location: "Golden 1 Center, Sacramento, CA",
+  reviewDate: "2026-07-30",
+};
+
+test("createReview inserts snake_cased columns plus the author id", async () => {
   const originalFetch = globalThis.fetch;
   let requestBody: unknown = null;
   globalThis.fetch = async (_url: RequestInfo | URL, init?: RequestInit) => {
     requestBody = init?.body ? JSON.parse(String(init.body)) : null;
-    return jsonResponse(
-      {
-        id: "new-1",
-        musician: "Nova Bloom",
-        venue: "The Granada",
-        concert_date: "2026-05-01",
-        review_text: "Great show",
-        venue_city: "Dallas",
-        venue_state: "TX",
-        venue_country: "US",
-        user_name: "Jan",
-        created_at: "2026-05-02T00:00:00Z",
-      },
-      201,
-    );
-  };
-  const input: NewReview = {
-    musician: "Nova Bloom",
-    venue: "The Granada",
-    concertDate: "2026-05-01",
-    reviewText: "Great show",
-    venueCity: "Dallas",
-    venueState: "TX",
-    venueCountry: "US",
-    userName: "Jan",
+    return jsonResponse(reviewRow({ id: "new-1" }), 201);
   };
   try {
-    const review = await createReview(input);
+    const review = await createReview(supabase, "author-1", newReview);
     assert.equal(review.id, "new-1");
   } finally {
     globalThis.fetch = originalFetch;
   }
   assert.deepEqual(requestBody, {
-    musician: "Nova Bloom",
-    venue: "The Granada",
-    concert_date: "2026-05-01",
-    review_text: "Great show",
-    venue_city: "Dallas",
-    venue_state: "TX",
-    venue_country: "US",
-    user_name: "Jan",
+    short_description: "Massive Attack at Golden 1 Center",
+    description: "Amazing performance, the visuals were incredible.",
+    star_rating: 4,
+    location: "Golden 1 Center, Sacramento, CA",
+    review_date: "2026-07-30",
+    author_id: "author-1",
   });
 });
 
-test("createReview defaults optional fields to null", async () => {
+test("createReview takes author_id from its argument, never from the input", async () => {
   const originalFetch = globalThis.fetch;
-  let requestBody: unknown = null;
+  let requestBody: Record<string, unknown> | null = null;
   globalThis.fetch = async (_url: RequestInfo | URL, init?: RequestInit) => {
     requestBody = init?.body ? JSON.parse(String(init.body)) : null;
-    return jsonResponse(
-      { id: "new-2", musician: "Solo Artist", venue: "Small Room", concert_date: "2026-05-01", review_text: "Fun", venue_city: null, venue_state: null, venue_country: null, user_name: null, created_at: "2026-05-02T00:00:00Z" },
-      201,
-    );
+    return jsonResponse(reviewRow({ id: "new-2" }), 201);
   };
   try {
-    await createReview({ musician: "Solo Artist", venue: "Small Room", concertDate: "2026-05-01", reviewText: "Fun" });
+    // A caller trying to smuggle an author_id through the input object must
+    // not be able to override the id the route derived from the session.
+    await createReview(supabase, "real-author", {
+      ...newReview,
+      author_id: "spoofed",
+    } as NewReview);
   } finally {
     globalThis.fetch = originalFetch;
   }
-  assert.deepEqual(requestBody, {
-    musician: "Solo Artist",
-    venue: "Small Room",
-    concert_date: "2026-05-01",
-    review_text: "Fun",
-    venue_city: null,
-    venue_state: null,
-    venue_country: null,
-    user_name: null,
-  });
+  assert.equal(requestBody!.author_id, "real-author");
 });
 
 test("createReview throws a ReviewsError on failure", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => jsonResponse({ message: "constraint violation" }, 400);
   try {
-    await assert.rejects(
-      createReview({ musician: "X", venue: "Y", concertDate: "2026-01-01", reviewText: "Z" }),
-      (err) => {
-        assert.ok(err instanceof ReviewsError);
-        assert.match(err.message, /Failed to create review: constraint violation/);
-        return true;
-      },
-    );
+    await assert.rejects(createReview(supabase, "author-1", newReview), (err) => {
+      assert.ok(err instanceof ReviewsError);
+      assert.match(err.message, /Failed to create review: constraint violation/);
+      return true;
+    });
   } finally {
     globalThis.fetch = originalFetch;
   }
