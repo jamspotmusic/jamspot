@@ -1,26 +1,14 @@
 import Constants from 'expo-constants';
 
 /**
- * Shape of a row from the live `reviews` table, as actually returned by
- * GET /api/reviews today. This intentionally does NOT reuse the `Review`
- * type from @jamspot/shared: that type (and apps/web/lib/reviews.ts) still
- * describe an older schema (musician/venue/review_text/...) that no longer
- * matches the database, which now has star ratings and an author_id/profiles
- * relation. Once the shared type and web backend are reconciled with the
- * live schema, this can go back to importing from @jamspot/shared.
+ * The live `reviews` row shape now lives in @jamspot/shared, which was
+ * reconciled against the database (star rating, free-text `location`, and an
+ * `author_id`/`profiles` relation). Re-exported here so the screens and cards
+ * that already import `Review` from this module keep working.
  */
-export type Review = {
-  id: string;
-  short_description: string;
-  description: string;
-  star_rating: number;
-  location: string;
-  review_date: string;
-  created_at: string;
-  updated_at: string;
-  author_id: string;
-  profiles: { username?: string; display_name?: string } | null;
-};
+import type { Review } from '@jamspot/shared';
+
+export type { Review };
 
 /**
  * Production: jamspotmusic.app, served from Vercel through Cloudflare. The

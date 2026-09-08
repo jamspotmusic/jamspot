@@ -208,6 +208,7 @@ export default function HomeScreen() {
             onSearchSuccess={handleLunaSuccess}
             onSearchError={handleLunaError}
           />
+
           <View style={styles.searchRow}>
             <SearchField
               icon={Search}
