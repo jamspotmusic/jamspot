@@ -27,36 +27,62 @@ export type NormalizedConcert = {
 };
 
 /**
- * Row shape of the `reviews` table.
+ * The author of a review, embedded from the `profiles` table via
+ * `reviews.author_id`.
  *
- * There is no `user_id` / accounts table - JamSpot has no authentication.
- * `user_name` is a plain, manually-entered text field, not a foreign key.
+ * Every field is optional and the whole object is nullable: a review whose
+ * `author_id` has no matching `profiles` row comes back with `profiles: null`,
+ * which is the case for the rows in the database today. Render it defensively
+ * (both clients fall back to "Anonymous").
+ */
+export type ReviewAuthor = {
+  id?: string;
+  username?: string | null;
+  created_at?: string;
+};
+
+/**
+ * Row shape of the `reviews` table, as the database actually returns it.
  *
- * Source of truth was apps/web/lib/reviews.ts.
+ * Verified against the live PostgREST schema rather than transcribed from
+ * older code: the earlier `musician` / `venue` / `concert_date` /
+ * `review_text` / `user_name` columns no longer exist, and the table now
+ * carries a star rating, a free-text `location`, and an `author_id` pointing
+ * at `profiles`.
+ *
+ * `profiles` is included by a plain `select("*")` — see apps/web/lib/reviews.ts.
+ *
+ * There are no vote columns. Upvote/downvote counts in the UI are
+ * presentational only and are not persisted anywhere.
  */
 export type Review = {
   id: string;
-  musician: string;
-  venue: string;
-  concert_date: string; // ISO date, e.g. "2026-05-01"
-  review_text: string;
-  venue_city: string | null;
-  venue_state: string | null;
-  venue_country: string | null;
-  user_name: string | null;
+  short_description: string;
+  description: string;
+  star_rating: number;
+  /** Free text, e.g. "Golden 1 Center, Sacramento, CA" - not split into venue/city/state. */
+  location: string;
+  /** ISO date, e.g. "2026-08-07". Date-only: no time component. */
+  review_date: string;
   created_at: string;
+  updated_at: string;
+  author_id: string;
+  profiles: ReviewAuthor | null;
 };
 
-/** Fields needed to create a new review. */
+/**
+ * Fields needed to create a new review.
+ *
+ * `author_id` is deliberately absent: it comes from the caller's authenticated
+ * session server-side, never from client input, since Row Level Security
+ * requires it to match the signed-in user.
+ */
 export type NewReview = {
-  musician: string;
-  venue: string;
-  concertDate: string;
-  reviewText: string;
-  venueCity?: string;
-  venueState?: string;
-  venueCountry?: string;
-  userName?: string;
+  shortDescription: string;
+  description: string;
+  starRating: number;
+  location: string;
+  reviewDate: string;
 };
 
 /** Fields that can be changed on an existing review. All optional. */
