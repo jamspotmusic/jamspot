@@ -481,6 +481,131 @@ email or touches the network. See `apps/web/tests/unit/auth.test.ts`.
 
 ---
 
+## Search (one field)
+
+Both apps have exactly **one search input**. The keyword field and the separate
+city/state field are gone — a single line of natural language covers everything
+they did, and everything they could not.
+
+```text
+chill jazz under $60 this weekend
+Radiohead
+something loud tonight
+Texas
+```
+
+### What happens to a query
+
+`resolveConcertSearch` in `packages/shared/src/index.ts` decides which of three
+things a query is, before anything is spent on it:
+
+| Input | Path | Why |
+| --- | --- | --- |
+| A bare state — `TX`, `Texas`, `Washington DC` | **Straight to Ticketmaster** as `stateCode` | There is no natural language in it to interpret. Sending it to the model would add a round trip and a token spend to produce a parameter already sitting in the input. |
+| Anything else | **Luna** (`concert-query` Edge Function), then Ticketmaster | Needs a model to turn words into a keyword, genres, a date range, a price ceiling, and a place. |
+| Blank, over 500 characters, or punctuation with no word in it | **Refused in the field** | Cannot be a search whatever it means, so no request is sent. |
+
+The state match is against the **whole** query, not a substring: `Texas` is a
+search for shows in Texas, but `Texas Hippie Coalition` is a band and
+`shows in Texas next month` carries a date, so both go to Luna. A query of
+exactly `OR`, `IN`, or `OK` is read as Oregon, Indiana, and Oklahoma —
+on a field whose entire content is those two letters, that is the reading that
+returns results.
+
+Whichever path runs, the output is a query string for `/api/concerts` — the
+same route, the same response shape, and the same card grid for all three.
+
+### Validating what comes back
+
+The Edge Function does not trust the model's output. OpenAI's strict JSON
+schema constrains it upstream, but a schema change, a model swap, a truncated
+response, or a proxy in between all arrive as ordinary JSON that `JSON.parse`
+accepts. So `handler.ts` validates in two layers:
+
+1. **Shape** — a **Zod** schema (`modelOutputSchema`) checks every field is
+   present and of the right type. Unknown keys are stripped rather than
+   rejected, so a field the model adds does not fail an otherwise good search.
+2. **Values** — the normalizers coerce each value into something Ticketmaster
+   accepts (`"ca"` → `"CA"`, `24.6` miles → `25`) or throw. A state name where
+   a state code belongs is plausible output that would return zero events, so
+   it is rejected rather than passed on.
+
+A third Zod schema, `ticketmasterParamsSchema`, is the last gate before the
+parameters leave. It rejects values Ticketmaster would not honour, and makes
+two things true by construction rather than by the good behaviour of the code
+above it:
+
+* **`classificationName` is required and must be music** — `"music"` itself or
+  a subset of Ticketmaster's music genres. Ticketmaster's catalogue is much
+  wider than music, and this is what keeps a JamSpot search inside the part of
+  it the app is about. A request for a sports fixture or a play cannot leave
+  the function even if the model builds one.
+* **A bare `"music"` classification is not a search on its own.** Without a
+  genre, a keyword, or a place beside it, that asks Ticketmaster for every
+  event it has.
+
+Anything that fails is a `502` with `"Unable to interpret concert query"`. The
+detail goes to the log, never to the client.
+
+### Scope
+
+A request is checked to be a live-music search **before** any of it reaches
+Ticketmaster. There are two gates:
+
+* **In the client**, structurally: blank, over-long, or wordless input is
+  refused without a network call.
+* **In the model**, semantically: the output schema carries `inScope` and
+  `rejection`. Out of scope covers more than off-topic chatter — it includes
+  **the non-music events Ticketmaster does sell**. `Lakers game tickets`,
+  `Hamilton on Broadway`, and `comedy show tonight` are all refused, as are
+  questions, requests for advice, anything about an existing order, and text
+  written at the model rather than at the search. The function answers `422`
+  with `code: "out_of_scope"` — no location resolved, no parameters built,
+  nothing the model extracted echoed back. Both apps show that sentence under
+  the field, and the hero stays where it is rather than switching to an empty
+  results view.
+* **When the model cannot tell**, `inScope` is false. Refusing a search
+  somebody meant costs them one retry; running one they did not mean returns
+  concerts to a person who asked about something else.
+
+The second gate has to be the model's: no pattern can tell
+`something loud tonight` from `what's the weather tonight`.
+
+A refusal is not the only thing standing between a non-music request and
+Ticketmaster. `classificationName` is *always* music (see above), so even a
+request the model wrongly lets through is searched against music events only —
+the model deciding is what makes it a clear refusal rather than an empty grid.
+
+A bare state skips the second gate, correctly — a state is a search parameter,
+not a question.
+
+### Where the code lives
+
+| Concern | Location |
+| --- | --- |
+| State list, bypass rule, scope refusals, search resolution | `packages/shared/src/index.ts` |
+| Model prompt, Zod validation, scope gate, location resolution | `supabase/functions/concert-query/handler.ts` |
+| Web field | `apps/web/components/LunaSearch.tsx` |
+| Mobile field | `apps/mobile/src/components/luna-search.tsx` |
+| Ticketmaster request | `apps/web/app/api/concerts/route.ts`, `apps/web/lib/ticketmaster.ts` |
+
+On web the field sits in the middle of the hero until the first search and in
+the header afterwards, so it stays reachable above the results. Only one is
+mounted at a time and the query is held by the page, so the text survives the
+move.
+
+### Running the search tests
+
+```bash
+npm run test:web        # the shared resolver, the field, and the page
+npm run test:functions  # the Edge Function, including Zod and scope
+npm run test:e2e        # the whole flow in a browser, with both paths mocked
+```
+
+No test reaches OpenAI, Supabase, or Ticketmaster.
+
+---
+
 ## Environment Variable Strategy
 
 JamSpot currently uses three separate environments.
