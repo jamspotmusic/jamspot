@@ -3,8 +3,10 @@ import { buildConcert, mockArtist, mockConcerts } from "../support/mock-api";
 
 async function searchAndOpenFirstCard(page: Page) {
   await page.goto("/");
-  await page.getByPlaceholder("City or state").fill("Dallas");
-  await page.getByPlaceholder("City or state").press("Enter");
+  // A bare state is answered straight from Ticketmaster, so opening a card
+  // needs no Edge Function mock (TEA-51).
+  await page.getByPlaceholder("Ask Luna").fill("TX");
+  await page.getByPlaceholder("Ask Luna").press("Enter");
   await page.getByRole("heading", { level: 3 }).first().click();
 }
 
@@ -171,8 +173,8 @@ test.describe("getting tickets from the results grid", () => {
     );
 
     await page.goto("/");
-    await page.getByPlaceholder("City or state").fill("Dallas");
-    await page.getByPlaceholder("City or state").press("Enter");
+    await page.getByPlaceholder("Ask Luna").fill("TX");
+    await page.getByPlaceholder("Ask Luna").press("Enter");
 
     const popupPromise = context.waitForEvent("page");
     await page.getByRole("button", { name: "Get Tickets" }).click();
@@ -187,8 +189,8 @@ test.describe("getting tickets from the results grid", () => {
     await mockConcerts(page, [buildConcert({ artist: "Nova Bloom", ticketUrl: null })]);
 
     await page.goto("/");
-    await page.getByPlaceholder("City or state").fill("Dallas");
-    await page.getByPlaceholder("City or state").press("Enter");
+    await page.getByPlaceholder("Ask Luna").fill("TX");
+    await page.getByPlaceholder("Ask Luna").press("Enter");
 
     const button = page.getByRole("button", { name: "Unavailable" });
     await expect(button).toBeVisible();
