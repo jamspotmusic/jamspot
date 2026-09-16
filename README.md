@@ -256,6 +256,20 @@ LASTFM_API_KEY=
 
 These variables are not required until the corresponding integrations are implemented.
 
+One more is optional but matters in deployed environments:
+
+```env
+NEXT_PUBLIC_SITE_URL=https://jamspot-three.vercel.app
+```
+
+It is the public origin the discovery pages build canonical URLs, Open Graph
+tags, the sitemap, and JSON-LD from. It must be the **public** domain — a
+canonical pointing at a preview deployment tells crawlers the preview is the
+real page. It defaults to the production deployment when unset, so local
+development needs nothing.
+
+`apps/web/.env.example` is the authoritative list.
+
 ### 5. Confirm `.env.local` Is Ignored
 
 Run:
@@ -603,6 +617,121 @@ npm run test:e2e        # the whole flow in a browser, with both paths mocked
 ```
 
 No test reaches OpenAI, Supabase, or Ticketmaster.
+
+---
+
+## Discovery pages (SEO)
+
+The search field is a fine way in **if you already have JamSpot open**. Someone
+arriving from a search engine does not, so JamSpot also publishes pages that
+answer a question by existing at a URL:
+
+```text
+/concerts/san-diego           Concerts in San Diego
+/concerts/san-diego/indie     Indie concerts in San Diego
+/artists/the-national         One act's upcoming dates
+/venues/belly-up-tavern       One room's schedule
+```
+
+Every one of them is server-rendered with the events already in the HTML, using
+the same `EventCard` grid and the same concert modal as a search. A crawler that
+executes no JavaScript sees the whole listing, and the ticket CTA still opens
+the same Ticketmaster URL it always did.
+
+### What decides that a URL exists
+
+Cities and genres come from curated registries in
+`apps/web/lib/discovery/taxonomy.ts` — 43 US markets, 17 genres. This is the
+load-bearing decision in the whole feature. Without a registry,
+`/concerts/<anything>` would be an open proxy onto the Ticketmaster Discovery
+API: unbounded requests against our rate limit, and an unbounded set of thin,
+near-identical pages for crawlers to find. An unresolvable slug is a **404**,
+and it costs no Ticketmaster request to say so.
+
+Artists and venues cannot work that way — there are hundreds of thousands of
+them and the set changes daily — so they are resolved against Ticketmaster on
+strict terms: the slug is searched as a keyword, a candidate counts only if its
+own name slugifies back to the requested slug, and identity from then on is the
+**Ticketmaster attraction/venue id**. That is what stops `/artists/the-national`
+from becoming a page about the Tom Petty tribute act a keyword search also
+returns, and what keeps "Belly Up Aspen" and "Belly Up Tavern" two rooms.
+
+### One URL per page
+
+`apps/web/proxy.ts` normalizes casing and formatting before the request reaches
+a route:
+
+```text
+/concerts/San-Diego     ─┐
+/concerts/SAN-DIEGO      ├─ 308 ─→  /concerts/san-diego
+/concerts/san--diego     │
+/concerts/san%20diego   ─┘
+```
+
+It has to happen in the proxy rather than in the page. These routes are
+incrementally regenerated, and a `redirect()` thrown during regeneration is
+cached as that path's own prerender — which produced a 307 that had lost its
+`Location` header. Normalizing first means only canonical paths are ever
+rendered or stored.
+
+Where Ticketmaster spells one entity two ways — it embeds a Milwaukee room in
+events as "The Rave/Eagles Club" while its venues endpoint calls the same room
+"Eagles Club/The Rave/Eagles Ballroom" — the alternate renders at 200 and points
+`<link rel="canonical">` at the entity's own URL, rather than redirecting.
+
+### What gets indexed
+
+A page earns indexing by answering the question its URL asks. It gets
+`noindex, follow` when it has no upcoming events, and when Ticketmaster could
+not be reached — an outage must not be published as a durable "nothing on here".
+`follow` stays on either way, so a quiet page is still a route through to the
+ones with shows.
+
+`Event` structured data carries only what Ticketmaster supplied. There is no
+`eventStatus`, no `eventAttendanceMode`, no `offers.availability` — a published
+price range says what tickets cost, not whether any are left — no street address
+for a venue we only have a city for, and no start time dressed up with a
+timezone Ticketmaster never gave.
+
+### The sitemap
+
+`/sitemap.xml` is derived from one pass of real data, not from arithmetic:
+
+```text
+1 request per registered city          →  43 requests
+city listed only if it returned events
+its genre pages read out of that same response  →  0 extra requests
+top artists/venues resolved through their own route helpers
+```
+
+That yields the ~460 city/genre combinations that actually have shows rather
+than all 731, and every artist and venue URL in the file has been confirmed to
+resolve. Roughly one slug in twenty guessed from an event's embedded name does
+*not* resolve against the attractions/venues search endpoints, and those are
+dropped rather than listed broken.
+
+### Analytics attribution
+
+`apps/web/lib/analytics/discovery-attribution.ts` carries a surface
+(`seo_city`, `seo_city_genre`, `seo_artist`, `seo_venue`) from the server-rendered
+route through the card and the detail modal onto the ticket click, so the
+journey from Google to Ticketmaster stays identifiable once TEA-54 lands.
+
+No analytics provider is wired up — TEA-54 owns that choice — so the default
+sink drops everything and integration is one `setAnalyticsSink` call. Nothing is
+appended to the Ticketmaster URL: affiliate and tracking parameters are out of
+scope until an affiliate agreement exists, so attribution is recorded on our
+side only.
+
+### Running the discovery tests
+
+```bash
+npm run test:web        # 97 tests across routing, slugs, canonicals,
+                        # metadata, indexability, entity identity,
+                        # structured data, and the sitemap
+```
+
+No test reaches Ticketmaster.
 
 ---
 
