@@ -94,3 +94,48 @@ test("GET /api/concerts returns 500 for a non-Ticketmaster error", async () => {
     globalThis.fetch = originalFetch;
   }
 });
+// TEA-52: direct Ticketmaster searches never touch the Luna limiter. They are
+// logged as bypasses so the two kinds of search can be compared.
+async function bypassEventsFor(query: string) {
+  const originalFetch = globalThis.fetch;
+  const originalInfo = console.info;
+  const lines: string[] = [];
+
+  globalThis.fetch = (async () =>
+    ({ ok: true, json: async () => ({ _embedded: { events: [] } }) }) as Response) as typeof fetch;
+  console.info = (...args: unknown[]) => {
+    lines.push(args.map(String).join(" "));
+  };
+
+  try {
+    await withEnv("TICKETMASTER_API_KEY", "key-123", async () => {
+      const response = await GET(new NextRequest(`http://localhost/api/concerts?${query}`));
+      assert.equal(response.status, 200);
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.info = originalInfo;
+  }
+
+  return lines
+    .map((line) => {
+      try {
+        return JSON.parse(line) as Record<string, unknown>;
+      } catch {
+        return null;
+      }
+    })
+    .filter((event) => event?.event === "luna_rate_limit_bypass");
+}
+
+test("GET /api/concerts logs a direct search as bypassing the Luna limiter", async () => {
+  const events = await bypassEventsFor("city=Dallas&stateCode=TX");
+  assert.deepEqual(events, [
+    { event: "luna_rate_limit_bypass", route: "direct_ticketmaster" },
+  ]);
+});
+
+test("GET /api/concerts does not log Luna's own handoff as a bypass", async () => {
+  const events = await bypassEventsFor("keyword=jazz&source=luna");
+  assert.deepEqual(events, []);
+});

@@ -4,14 +4,16 @@ import { useState, type FormEvent } from "react";
 import { Sparkles } from "lucide-react";
 import {
   buildConcertsQuery,
+  getOrCreateLunaSessionId,
   interpretConcertQuery,
+  LUNA_SESSION_ID_HEADER,
   type ConcertQueryBody,
   type ConcertQueryResponse,
   type DeviceLocation,
   type NormalizedConcert,
 } from "@jamspot/shared";
 
-import { supabase } from "@/lib/supabase";
+import { createClient } from "@/lib/supabase-browser";
 
 /**
  * Ask the browser for coordinates. Resolves null when geolocation is
@@ -36,13 +38,32 @@ export function requestBrowserLocation(): Promise<DeviceLocation | null> {
   });
 }
 
+/** localStorage, or null where it isn't available (SSR, some private modes). */
+function browserStorage() {
+  try {
+    return typeof window !== "undefined" ? window.localStorage : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Invoke the `concert-query` Edge Function. The browser only ever talks to
  * Supabase here - the OpenAI credential lives in the function's own
  * server-side env and never reaches the client.
+ *
+ * Uses the cookie-backed auth client (lib/supabase-browser.ts), so a
+ * signed-in user's access token is sent and the function rate-limits them
+ * by their verified user ID. Signed-out visitors send the anonymous session
+ * ID instead (TEA-52).
  */
-async function invokeConcertQuery(body: ConcertQueryBody) {
-  return supabase.functions.invoke("concert-query", { body });
+export async function invokeConcertQuery(body: ConcertQueryBody) {
+  const sessionId = await getOrCreateLunaSessionId(browserStorage());
+
+  return createClient().functions.invoke("concert-query", {
+    body,
+    headers: { [LUNA_SESSION_ID_HEADER]: sessionId },
+  });
 }
 
 export default function LunaSearch({

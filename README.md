@@ -350,6 +350,31 @@ export const supabase = createClient(
 );
 ```
 
+## Luna Rate Limiting (TEA-52)
+
+The `concert-query` Edge Function limits Luna searches before it calls the LLM:
+
+```text
+request -> routing decision -> Luna required? -> rate-limit check -> Luna call
+```
+
+* Only requests that reach Luna are counted. Invalid requests are rejected before the limiter, and direct Ticketmaster searches (`/api/concerts`) never reach it.
+* Identity: the verified Supabase user ID for signed-in users. Anonymous users are identified by the `x-jamspot-session-id` header combined with their IP address, and each IP address also has a shared ceiling.
+* Over the limit, the function returns HTTP `429` with `{ "type": "rate_limit_error", "code": "luna_rate_limit_exceeded", "message": "..." }` and a `Retry-After` header.
+* Counters live in `public.luna_rate_limits`, and `public.consume_luna_rate_limit` checks and counts in one transaction. Only `service_role` can execute it.
+* If the counter store is unavailable, the function returns `503` and does not call Luna (it fails closed).
+
+Apply the migration, then set limits without a code change:
+
+```bash
+supabase db push
+supabase secrets set LUNA_RATE_LIMIT_MAX_REQUESTS=20 LUNA_RATE_LIMIT_WINDOW_SECONDS=60
+# optional, defaults to 5x the per-caller limit
+supabase secrets set LUNA_RATE_LIMIT_IP_MAX_REQUESTS=100
+```
+
+Structured logs (filter on `event`): `luna_rate_limit` (`outcome`: `allowed` / `rejected` / `unavailable`, plus `identityType`, `limit`, `windowSeconds`), `luna_route` (requests rejected before Luna), and `luna_rate_limit_bypass` (direct Ticketmaster searches, logged by `/api/concerts`). Tokens, session IDs and IP addresses are never logged.
+
 ## Supabase Connection Test
 
 During initial setup, JamSpot uses a temporary connection-test page:
