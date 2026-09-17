@@ -3,8 +3,14 @@ import test from "node:test";
 
 import {
   buildConcertsQuery,
+  createLunaSessionId,
   describeConcertQueryError,
+  getOrCreateLunaSessionId,
   interpretConcertQuery,
+  LUNA_RATE_LIMIT_CODE,
+  LUNA_RATE_LIMIT_MESSAGE,
+  LUNA_SESSION_ID_HEADER,
+  LUNA_SESSION_ID_STORAGE_KEY,
   type ConcertQueryBody,
   type DeviceLocation,
 } from "@jamspot/shared";
@@ -284,4 +290,188 @@ test("interpretConcertQuery rejects a response missing ticketmasterParams", asyn
     ),
     /Concert query returned an invalid response/,
   );
+});
+// --- Luna rate limiting (TEA-52) -----------------------------------------
+
+test("buildConcertsQuery tags the handoff as a Luna search", () => {
+  const search = new URLSearchParams(buildConcertsQuery({ keyword: "jazz" }));
+  assert.equal(search.get("source"), "luna");
+});
+
+test("describeConcertQueryError reads the rate-limit body's message and code", async () => {
+  const result = await describeConcertQueryError(
+    httpError({
+      type: "rate_limit_error",
+      code: "luna_rate_limit_exceeded",
+      message: "Too many AI-powered searches. Please try again shortly.",
+    }),
+  );
+
+  assert.equal(result.code, LUNA_RATE_LIMIT_CODE);
+  assert.equal(result.message, LUNA_RATE_LIMIT_MESSAGE);
+});
+
+test("describeConcertQueryError treats an unreadable 429 as a rate limit", async () => {
+  const result = await describeConcertQueryError({
+    name: "FunctionsHttpError",
+    message: "Edge Function returned a non-2xx status code",
+    context: {
+      status: 429,
+      json: async () => {
+        throw new Error("not json");
+      },
+    },
+  });
+
+  assert.equal(result.code, LUNA_RATE_LIMIT_CODE);
+  assert.equal(result.message, LUNA_RATE_LIMIT_MESSAGE);
+});
+
+test("interpretConcertQuery surfaces a rate limit without asking for a location or retrying", async () => {
+  let calls = 0;
+  let locationRequested = false;
+
+  await assert.rejects(
+    interpretConcertQuery(
+      async () => {
+        calls += 1;
+        return {
+          data: null,
+          error: httpError({
+            type: "rate_limit_error",
+            code: "luna_rate_limit_exceeded",
+            message: LUNA_RATE_LIMIT_MESSAGE,
+          }),
+        };
+      },
+      "jazz tonight",
+      "UTC",
+      async () => {
+        locationRequested = true;
+        return null;
+      },
+    ),
+    { message: LUNA_RATE_LIMIT_MESSAGE },
+  );
+
+  assert.equal(calls, 1);
+  assert.equal(locationRequested, false);
+});
+
+test("interpretConcertQuery surfaces a rate limit hit on the location retry", async () => {
+  const responses = [
+    httpError({ error: "Share your location", code: "location_required" }),
+    httpError({
+      type: "rate_limit_error",
+      code: "luna_rate_limit_exceeded",
+      message: LUNA_RATE_LIMIT_MESSAGE,
+    }),
+  ];
+
+  await assert.rejects(
+    interpretConcertQuery(
+      async () => ({ data: null, error: responses.shift() }),
+      "concerts tonight",
+      "UTC",
+      someLocation,
+    ),
+    { message: LUNA_RATE_LIMIT_MESSAGE },
+  );
+});
+
+function memoryStorage(initial: Record<string, string> = {}) {
+  const values = new Map(Object.entries(initial));
+  return {
+    values,
+    getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => {
+      values.set(key, value);
+    },
+  };
+}
+
+test("getOrCreateLunaSessionId creates, stores, and then reuses a session ID", async () => {
+  const storage = memoryStorage();
+
+  const first = await getOrCreateLunaSessionId(storage);
+  assert.match(first, /^[0-9a-f-]{36}$/);
+  assert.equal(storage.values.get(LUNA_SESSION_ID_STORAGE_KEY), first);
+
+  assert.equal(await getOrCreateLunaSessionId(storage), first);
+});
+
+test("getOrCreateLunaSessionId works with async storage and replaces an invalid stored value", async () => {
+  const values = new Map([[LUNA_SESSION_ID_STORAGE_KEY, "bad value"]]);
+  const storage = {
+    getItem: async (key: string) => values.get(key) ?? null,
+    setItem: async (key: string, value: string) => {
+      values.set(key, value);
+    },
+  };
+
+  const id = await getOrCreateLunaSessionId(storage);
+  assert.notEqual(id, "bad value");
+  assert.equal(values.get(LUNA_SESSION_ID_STORAGE_KEY), id);
+});
+
+test("getOrCreateLunaSessionId falls back to a stable in-memory ID when storage fails", async () => {
+  const broken = {
+    getItem: () => {
+      throw new Error("SecurityError");
+    },
+    setItem: () => {
+      throw new Error("SecurityError");
+    },
+  };
+
+  const a = await getOrCreateLunaSessionId(broken);
+  const b = await getOrCreateLunaSessionId(null);
+  assert.match(a, /^[0-9a-f-]{36}$/);
+  assert.equal(a, b);
+});
+
+test("createLunaSessionId falls back when crypto.randomUUID is unavailable", () => {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "crypto");
+  Object.defineProperty(globalThis, "crypto", {
+    value: {},
+    configurable: true,
+  });
+
+  try {
+    const id = createLunaSessionId();
+    assert.match(
+      id,
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+  } finally {
+    if (original) Object.defineProperty(globalThis, "crypto", original);
+  }
+});
+
+test("invokeConcertQuery sends the anonymous session ID header", async () => {
+  const originalFetch = globalThis.fetch;
+  const seen: Headers[] = [];
+
+  globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+    seen.push(new Headers(init?.headers));
+    return new Response(JSON.stringify({ ticketmasterParams: {} }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }) as typeof fetch;
+
+  try {
+    const { invokeConcertQuery } = await import("@/components/LunaSearch");
+    const { error } = await invokeConcertQuery({
+      query: "jazz",
+      timeZone: "UTC",
+    });
+
+    assert.equal(error, null);
+    const sent = seen.find((headers) => headers.has(LUNA_SESSION_ID_HEADER));
+    assert.ok(sent, "session header was sent");
+    assert.match(sent.get(LUNA_SESSION_ID_HEADER)!, /^[0-9a-f-]{36}$/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

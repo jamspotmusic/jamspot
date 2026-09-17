@@ -46,6 +46,12 @@ import {
   toTicketmasterParams,
 } from "./handler.ts";
 
+import {
+  InMemoryRateLimitStore,
+  LunaRateLimiter,
+  type RateLimitStore,
+} from "./rate-limit.ts";
+
 /* -------------------------------------------------------------------------
  * Test helpers
  * ---------------------------------------------------------------------- */
@@ -143,6 +149,13 @@ type RunOptions = {
   apiKey?: string | null;
   /** What the stubbed fetch does. Defaults to a successful OpenAI response. */
   openAI?: () => Response | Promise<Response>;
+  /** Verified Supabase user ID, as index.ts would pass it. */
+  userId?: string | null;
+  /**
+   * Defaults to a fresh in-memory limiter with the default limits, so tests
+   * that aren't about rate limiting are never throttled.
+   */
+  rateLimiter?: LunaRateLimiter;
 };
 
 type RunResult = {
@@ -150,6 +163,10 @@ type RunResult = {
   json: Record<string, unknown>;
   requests: CapturedRequest[];
   errors: unknown[][];
+  /** Parsed structured log lines written with console.info. */
+  events: Record<string, unknown>[];
+  /** Everything written to any console method, for leak checks. */
+  logText: string;
 };
 
 /** The default model output: an explicit, fully-anchored Oakland search. */
@@ -172,14 +189,23 @@ async function run(
     headers = {},
     apiKey = "test-openai-key",
     openAI = () => Response.json(openAIPayload(oaklandJazz())),
+    userId = null,
+    rateLimiter = new LunaRateLimiter(
+      new InMemoryRateLimitStore(),
+      () => undefined,
+    ),
   }: RunOptions = {},
 ): Promise<RunResult> {
   const originalFetch = globalThis.fetch;
   const originalError = console.error;
+  const originalInfo = console.info;
+  const originalWarn = console.warn;
   const originalKey = Deno.env.get("OPENAI_API_KEY");
 
   const requests: CapturedRequest[] = [];
   const errors: unknown[][] = [];
+  const events: Record<string, unknown>[] = [];
+  const logLines: string[] = [];
 
   if (apiKey === null) {
     Deno.env.delete("OPENAI_API_KEY");
@@ -198,8 +224,26 @@ async function run(
     return Promise.resolve(openAI());
   }) as typeof fetch;
 
+  const stringify = (args: unknown[]) =>
+    args.map((arg) => typeof arg === "string" ? arg : JSON.stringify(arg))
+      .join(" ");
+
   console.error = (...args: unknown[]) => {
     errors.push(args);
+    logLines.push(stringify(args));
+  };
+
+  console.warn = (...args: unknown[]) => {
+    logLines.push(stringify(args));
+  };
+
+  console.info = (...args: unknown[]) => {
+    logLines.push(stringify(args));
+    try {
+      events.push(JSON.parse(String(args[0])));
+    } catch {
+      // Not a structured event.
+    }
   };
 
   try {
@@ -211,13 +255,25 @@ async function run(
       }),
     });
 
-    const response = await handleConcertQuery(request);
+    const response = await handleConcertQuery(request, {
+      userId,
+      rateLimiter,
+    });
     const json = await response.clone().json() as Record<string, unknown>;
 
-    return { response, json, requests, errors };
+    return {
+      response,
+      json,
+      requests,
+      errors,
+      events,
+      logText: logLines.join("\n"),
+    };
   } finally {
     globalThis.fetch = originalFetch;
     console.error = originalError;
+    console.info = originalInfo;
+    console.warn = originalWarn;
     if (originalKey === undefined) {
       Deno.env.delete("OPENAI_API_KEY");
     } else {
@@ -1622,4 +1678,415 @@ Deno.test("handleConcertQuery never echoes upstream error detail or the API key"
   assertEquals(serialized.includes("sk-super-secret"), false);
   assertEquals(serialized.includes("Incorrect API key"), false);
   assertEquals(json.error, "Unable to interpret concert query");
+});
+
+/* -------------------------------------------------------------------------
+ * handleConcertQuery - Luna rate limiting (TEA-52)
+ * ---------------------------------------------------------------------- */
+
+const RATE_LIMIT_BODY = {
+  type: "rate_limit_error",
+  code: "luna_rate_limit_exceeded",
+  message: "Too many AI-powered searches. Please try again shortly.",
+};
+
+/** A controllable clock, starting at the beginning of a 60-second window. */
+function fakeClock(start = Date.UTC(2026, 8, 16, 12, 0, 0)) {
+  let now = start;
+  return {
+    now: () => now,
+    advance: (ms: number) => {
+      now += ms;
+    },
+  };
+}
+
+/** Wraps a store so tests can count how often capacity was consumed. */
+function spyStore(inner: RateLimitStore) {
+  const calls: number[] = [];
+  const store: RateLimitStore = {
+    consume(buckets, windowSeconds) {
+      calls.push(buckets.length);
+      return inner.consume(buckets, windowSeconds);
+    },
+  };
+  return { store, calls };
+}
+
+function limiterWith(
+  {
+    max = "2",
+    window = "60",
+    ipMax,
+    clock = fakeClock(),
+    store,
+  }: {
+    max?: string;
+    window?: string;
+    ipMax?: string;
+    clock?: ReturnType<typeof fakeClock>;
+    store?: RateLimitStore;
+  } = {},
+) {
+  const memory = new InMemoryRateLimitStore(clock.now);
+  const spy = spyStore(store ?? memory);
+  const env: Record<string, string | undefined> = {
+    LUNA_RATE_LIMIT_MAX_REQUESTS: max,
+    LUNA_RATE_LIMIT_WINDOW_SECONDS: window,
+    LUNA_RATE_LIMIT_IP_MAX_REQUESTS: ipMax,
+  };
+  return {
+    limiter: new LunaRateLimiter(spy.store, (name) => env[name]),
+    consumed: spy.calls,
+    clock,
+    env,
+  };
+}
+
+const ANON_HEADERS = {
+  "x-jamspot-session-id": "3f1c2b8e-9d4a-4c1e-8f7a-2b6d5e4c3a21",
+  "x-forwarded-for": "203.0.113.7, 10.0.0.1",
+};
+
+Deno.test("rate limit: requests under the limit reach Luna and are logged as allowed", async () => {
+  const { limiter } = limiterWith({ max: "2" });
+
+  for (let i = 0; i < 2; i++) {
+    const { response, requests, events } = await run({
+      rateLimiter: limiter,
+      headers: ANON_HEADERS,
+    });
+
+    assertEquals(response.status, 200);
+    assertEquals(requests.length, 1);
+    assertObjectMatch(
+      events.find((e) => e.event === "luna_rate_limit")!,
+      {
+        outcome: "allowed",
+        identityType: "session",
+        limit: 2,
+        windowSeconds: 60,
+      },
+    );
+  }
+});
+
+Deno.test("rate limit: a request over the limit gets 429 and never calls the LLM", async () => {
+  const { limiter } = limiterWith({ max: "2" });
+
+  await run({ rateLimiter: limiter, headers: ANON_HEADERS });
+  await run({ rateLimiter: limiter, headers: ANON_HEADERS });
+
+  const { response, json, requests, events } = await run({
+    rateLimiter: limiter,
+    headers: ANON_HEADERS,
+  });
+
+  assertEquals(response.status, 429);
+  assertEquals(json, RATE_LIMIT_BODY);
+  assertEquals(requests.length, 0, "OpenAI must not be called");
+  assertEquals(response.headers.get("Retry-After"), "60");
+  assertObjectMatch(
+    events.find((e) => e.event === "luna_rate_limit")!,
+    { outcome: "rejected", identityType: "session" },
+  );
+});
+
+Deno.test("rate limit: the 429 body exposes no counters or infrastructure details", async () => {
+  const { limiter } = limiterWith({ max: "1" });
+
+  await run({ rateLimiter: limiter, headers: ANON_HEADERS });
+  const { json } = await run({ rateLimiter: limiter, headers: ANON_HEADERS });
+
+  assertEquals(Object.keys(json).sort(), ["code", "message", "type"]);
+  const text = JSON.stringify(json);
+  for (const leak of ["203.0.113.7", "luna:v1", "supabase", "remaining", "count", "window"]) {
+    assertEquals(text.toLowerCase().includes(leak), false, leak);
+  }
+});
+
+Deno.test("rate limit: capacity comes back when the window resets", async () => {
+  const clock = fakeClock();
+  const { limiter } = limiterWith({ max: "1", window: "60", clock });
+
+  assertEquals(
+    (await run({ rateLimiter: limiter, headers: ANON_HEADERS })).response
+      .status,
+    200,
+  );
+
+  clock.advance(30_000);
+  const blocked = await run({ rateLimiter: limiter, headers: ANON_HEADERS });
+  assertEquals(blocked.response.status, 429);
+  assertEquals(blocked.response.headers.get("Retry-After"), "30");
+
+  clock.advance(30_000);
+  const reset = await run({ rateLimiter: limiter, headers: ANON_HEADERS });
+  assertEquals(reset.response.status, 200);
+  assertEquals(reset.requests.length, 1);
+});
+
+Deno.test("rate limit: requests rejected before Luna do not consume capacity", async () => {
+  const { limiter, consumed } = limiterWith({ max: "1" });
+
+  const rejected: RunOptions[] = [
+    { method: "GET" },
+    { body: "{not json" },
+    { body: null },
+    { body: ["jazz"] },
+    { body: {} },
+    { body: { query: "   " } },
+    { body: { query: 42 } },
+    { body: { query: "x".repeat(501) } },
+  ];
+
+  for (const options of rejected) {
+    const { response, requests, events } = await run({
+      ...options,
+      rateLimiter: limiter,
+      headers: ANON_HEADERS,
+    });
+
+    assert(response.status >= 400 && response.status < 500);
+    assert(response.status !== 429, "routing rejections are not rate limited");
+    assertEquals(requests.length, 0);
+    assertObjectMatch(events.find((e) => e.event === "luna_route")!, {
+      route: "rejected",
+    });
+  }
+
+  assertEquals(consumed.length, 0, "the limiter was never consulted");
+
+  // The single allowed Luna request is still available.
+  const { response } = await run({ rateLimiter: limiter, headers: ANON_HEADERS });
+  assertEquals(response.status, 200);
+});
+
+Deno.test("rate limit: an unconfigured function does not consume capacity", async () => {
+  const { limiter, consumed } = limiterWith({ max: "1" });
+
+  const { response } = await run({ rateLimiter: limiter, apiKey: null });
+
+  assertEquals(response.status, 500);
+  assertEquals(consumed.length, 0);
+});
+
+Deno.test("rate limit: a failed Luna request still counts once the provider was called", async () => {
+  const { limiter } = limiterWith({ max: "1" });
+
+  const failed = await run({
+    rateLimiter: limiter,
+    headers: ANON_HEADERS,
+    openAI: () => Response.json({ error: {} }, { status: 500 }),
+  });
+  assertEquals(failed.response.status, 502);
+  assertEquals(failed.requests.length, 1);
+
+  const next = await run({ rateLimiter: limiter, headers: ANON_HEADERS });
+  assertEquals(next.response.status, 429);
+  assertEquals(next.requests.length, 0);
+});
+
+Deno.test("rate limit: a network failure reaching the provider still counts", async () => {
+  const { limiter } = limiterWith({ max: "1" });
+
+  const failed = await run({
+    rateLimiter: limiter,
+    headers: ANON_HEADERS,
+    openAI: () => {
+      throw new TypeError("network down");
+    },
+  });
+  assertEquals(failed.response.status, 502);
+
+  const next = await run({ rateLimiter: limiter, headers: ANON_HEADERS });
+  assertEquals(next.response.status, 429);
+});
+
+Deno.test("rate limit: a location_required round trip counts each Luna call", async () => {
+  const { limiter } = limiterWith({ max: "1" });
+
+  // No place named, nothing to geolocate from: Luna runs, then asks for a location.
+  const first = await run({
+    rateLimiter: limiter,
+    headers: ANON_HEADERS,
+    body: { query: "concerts tonight" },
+    openAI: () => Response.json(openAIPayload(criteria())),
+  });
+  assertEquals(first.response.status, 422);
+  assertEquals(first.json.code, "location_required");
+
+  // The retry would call Luna again, so it is limited like any other call.
+  const retry = await run({
+    rateLimiter: limiter,
+    headers: ANON_HEADERS,
+    body: { query: "concerts tonight", geolocationDenied: true },
+  });
+  assertEquals(retry.response.status, 429);
+  assertEquals(retry.requests.length, 0);
+});
+
+Deno.test("rate limit: fails closed with 503 when the counter store is unavailable", async () => {
+  const broken: RateLimitStore = {
+    consume: () => Promise.reject(new Error("connection refused")),
+  };
+  const { limiter } = limiterWith({ store: broken });
+
+  const { response, json, requests } = await run({
+    rateLimiter: limiter,
+    headers: ANON_HEADERS,
+  });
+
+  assertEquals(response.status, 503);
+  assertEquals(json.type, "rate_limit_error");
+  assertEquals(json.code, "luna_rate_limit_unavailable");
+  assertEquals(requests.length, 0, "no fallback path may reach the LLM");
+});
+
+Deno.test("rate limit: authenticated users are limited by their verified user ID", async () => {
+  const { limiter } = limiterWith({ max: "1" });
+  const userId = "7b0a4e6c-1d2f-4a3b-9c8d-5e6f7a8b9c0d";
+
+  const first = await run({
+    rateLimiter: limiter,
+    userId,
+    headers: { ...ANON_HEADERS, "x-jamspot-session-id": "a".repeat(32) },
+  });
+  assertEquals(first.response.status, 200);
+  assertObjectMatch(first.events.find((e) => e.event === "luna_rate_limit")!, {
+    identityType: "user",
+  });
+
+  // A new session ID or IP address doesn't give the same user more capacity.
+  const second = await run({
+    rateLimiter: limiter,
+    userId,
+    headers: {
+      "x-jamspot-session-id": "b".repeat(32),
+      "x-forwarded-for": "198.51.100.1",
+    },
+  });
+  assertEquals(second.response.status, 429);
+
+  // A different user, or an anonymous caller, has their own capacity.
+  const other = await run({
+    rateLimiter: limiter,
+    userId: "00000000-0000-4000-8000-000000000000",
+  });
+  assertEquals(other.response.status, 200);
+
+  const anonymous = await run({ rateLimiter: limiter, headers: ANON_HEADERS });
+  assertEquals(anonymous.response.status, 200);
+});
+
+Deno.test("rate limit: a user ID in the request body is ignored", async () => {
+  const { limiter } = limiterWith({ max: "1" });
+
+  await run({ rateLimiter: limiter, headers: ANON_HEADERS });
+
+  const spoofed = await run({
+    rateLimiter: limiter,
+    headers: ANON_HEADERS,
+    body: {
+      query: "jazz in Oakland",
+      userId: "7b0a4e6c-1d2f-4a3b-9c8d-5e6f7a8b9c0d",
+      user_id: "7b0a4e6c-1d2f-4a3b-9c8d-5e6f7a8b9c0d",
+    },
+  });
+
+  assertEquals(spoofed.response.status, 429);
+});
+
+Deno.test("rate limit: anonymous sessions are separate, but share an IP address ceiling", async () => {
+  const { limiter } = limiterWith({ max: "1", ipMax: "3" });
+  const ip = { "x-forwarded-for": "203.0.113.7" };
+  const session = (n: number) => ({
+    ...ip,
+    "x-jamspot-session-id": `session-${n}`.padEnd(24, "x"),
+  });
+
+  // The same session is stable across requests.
+  assertEquals(
+    (await run({ rateLimiter: limiter, headers: session(1) })).response.status,
+    200,
+  );
+  assertEquals(
+    (await run({ rateLimiter: limiter, headers: session(1) })).response.status,
+    429,
+  );
+
+  // Other sessions on the same network each get their own capacity...
+  assertEquals(
+    (await run({ rateLimiter: limiter, headers: session(2) })).response.status,
+    200,
+  );
+  assertEquals(
+    (await run({ rateLimiter: limiter, headers: session(3) })).response.status,
+    200,
+  );
+
+  // ...until the IP address ceiling stops a client that keeps making up new IDs.
+  const rotated = await run({ rateLimiter: limiter, headers: session(4) });
+  assertEquals(rotated.response.status, 429);
+  assertEquals(rotated.requests.length, 0);
+
+  // A different IP address is unaffected.
+  const elsewhere = await run({
+    rateLimiter: limiter,
+    headers: {
+      "x-forwarded-for": "198.51.100.1",
+      "x-jamspot-session-id": "session-4".padEnd(24, "x"),
+    },
+  });
+  assertEquals(elsewhere.response.status, 200);
+});
+
+Deno.test("rate limit: configuration is read at request time", async () => {
+  const { limiter, env } = limiterWith({ max: "1" });
+
+  await run({ rateLimiter: limiter, headers: ANON_HEADERS });
+  assertEquals(
+    (await run({ rateLimiter: limiter, headers: ANON_HEADERS })).response
+      .status,
+    429,
+  );
+
+  // Raising the secret takes effect on the next request, with no redeploy.
+  env.LUNA_RATE_LIMIT_MAX_REQUESTS = "3";
+  const { response, events } = await run({
+    rateLimiter: limiter,
+    headers: ANON_HEADERS,
+  });
+  assertEquals(response.status, 200);
+  assertObjectMatch(events.find((e) => e.event === "luna_rate_limit")!, {
+    limit: 3,
+  });
+});
+
+Deno.test("rate limit: logs never contain tokens, session IDs, IP addresses, or bucket keys", async () => {
+  const { limiter } = limiterWith({ max: "1" });
+  const headers = {
+    ...ANON_HEADERS,
+    Authorization: "Bearer eyJhbGciOiJIUzI1NiJ9.secret-payload.signature",
+    apikey: "sb_publishable_supersecret",
+  };
+
+  const allowed = await run({ rateLimiter: limiter, headers });
+  const rejected = await run({ rateLimiter: limiter, headers });
+  const routed = await run({ rateLimiter: limiter, headers, method: "GET" });
+
+  for (const { logText } of [allowed, rejected, routed]) {
+    for (
+      const secret of [
+        "eyJhbGciOiJIUzI1NiJ9",
+        "sb_publishable_supersecret",
+        "test-openai-key",
+        ANON_HEADERS["x-jamspot-session-id"],
+        "203.0.113.7",
+        "luna:v1",
+      ]
+    ) {
+      assertEquals(logText.includes(secret), false, secret);
+    }
+  }
 });

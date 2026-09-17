@@ -492,6 +492,87 @@ export type ConcertQueryInvoker = (
  */
 export type DeviceLocationProvider = () => Promise<DeviceLocation | null>;
 
+/** `code` the Edge Function returns with HTTP 429 when Luna is rate limited. */
+export const LUNA_RATE_LIMIT_CODE = "luna_rate_limit_exceeded";
+
+/** Mirrors the message the Edge Function sends with a 429. */
+export const LUNA_RATE_LIMIT_MESSAGE =
+  "Too many AI-powered searches. Please try again shortly.";
+
+/**
+ * Header that carries the anonymous JamSpot session ID to `concert-query`.
+ * The function pairs it with the caller's IP address for rate limiting and
+ * uses a signed-in user's verified ID instead when there is one. It is not an
+ * auth credential and grants nothing.
+ */
+export const LUNA_SESSION_ID_HEADER = "x-jamspot-session-id";
+
+/** Storage key the session ID is kept under on both platforms. */
+export const LUNA_SESSION_ID_STORAGE_KEY = "jamspot.lunaSessionId";
+
+/**
+ * A key-value store: localStorage on web, AsyncStorage on mobile. Both sync
+ * and async implementations fit this shape.
+ */
+export type SessionIdStorage = {
+  getItem(key: string): string | null | Promise<string | null>;
+  setItem(key: string, value: string): void | Promise<void>;
+};
+
+const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{16,128}$/;
+
+/**
+ * A random v4 UUID. Uses crypto.randomUUID where the platform has it.
+ * Hermes (React Native) may not, so there is a fallback. The ID only groups
+ * one device's searches for rate limiting, so the fallback's weaker
+ * randomness is fine here.
+ */
+export function createLunaSessionId(): string {
+  const cryptoApi = (globalThis as { crypto?: { randomUUID?: () => string } })
+    .crypto;
+
+  if (typeof cryptoApi?.randomUUID === "function") {
+    return cryptoApi.randomUUID();
+  }
+
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (char) => {
+    const random = Math.floor(Math.random() * 16);
+    return (char === "x" ? random : (random & 0x3) | 0x8).toString(16);
+  });
+}
+
+// Used when storage is unavailable (private browsing, storage errors), so a
+// session still keeps one ID for as long as the app is running.
+let memorySessionId: string | null = null;
+
+/**
+ * Returns this device's anonymous session ID, creating and saving one the
+ * first time. It never throws: if storage fails, it falls back to an ID
+ * kept in memory.
+ */
+export async function getOrCreateLunaSessionId(
+  storage: SessionIdStorage | null | undefined,
+): Promise<string> {
+  if (storage) {
+    try {
+      const existing = await storage.getItem(LUNA_SESSION_ID_STORAGE_KEY);
+      if (existing && SESSION_ID_PATTERN.test(existing)) {
+        return existing;
+      }
+
+      const created = memorySessionId ?? createLunaSessionId();
+      await storage.setItem(LUNA_SESSION_ID_STORAGE_KEY, created);
+      memorySessionId = created;
+      return created;
+    } catch {
+      // Fall through to the in-memory ID.
+    }
+  }
+
+  memorySessionId ??= createLunaSessionId();
+  return memorySessionId;
+}
+
 const CONCERT_QUERY_FAILURE = "Concert query failed.";
 const INVALID_RESPONSE =
   "Concert query returned an invalid response.";
@@ -514,25 +595,47 @@ export async function describeConcertQueryError(
   const candidate = error as {
     name?: string;
     message?: string;
-    context?: { json?: () => Promise<unknown> };
+    context?: { json?: () => Promise<unknown>; status?: number };
   };
 
   if (candidate.name === "FunctionsHttpError" && candidate.context?.json) {
     try {
       const payload = (await candidate.context.json()) as {
         error?: unknown;
+        message?: unknown;
         code?: unknown;
       };
 
-      if (typeof payload?.error === "string") {
+      // Most errors use `{ error, code }`. The rate-limit errors (TEA-52) use
+      // `{ type, code, message }`, so both are read.
+      const message =
+        typeof payload?.error === "string"
+          ? payload.error
+          : typeof payload?.message === "string"
+            ? payload.message
+            : null;
+
+      if (message) {
         return {
-          message: payload.error,
+          message,
           code: typeof payload.code === "string" ? payload.code : undefined,
         };
       }
     } catch {
       // Body wasn't JSON. Fall through to the error's own message.
     }
+  }
+
+  // A 429 whose body couldn't be read (a proxy in between, for example) is
+  // still a rate limit and should read like one.
+  if (
+    candidate.name === "FunctionsHttpError" &&
+    candidate.context?.status === 429
+  ) {
+    return {
+      message: LUNA_RATE_LIMIT_MESSAGE,
+      code: LUNA_RATE_LIMIT_CODE,
+    };
   }
 
   if (candidate.name === "FunctionsRelayError") {
@@ -613,7 +716,7 @@ export async function interpretConcertQuery(
  * Serialize the Edge Function's output into a query string for
  * /api/concerts, dropping anything empty. The route accepts these param
  * names verbatim, including the geolocated form (geoPoint + radius) and the
- * price bounds Ticketmaster itself can't filter on.
+ * price bounds Ticketmaster itself can't filter on. Adds `source=luna`.
  */
 export function buildConcertsQuery(
   params: TicketmasterParams,
@@ -632,6 +735,11 @@ export function buildConcertsQuery(
       search.set(key, String(value));
     }
   }
+
+  // Tells /api/concerts that this search came from Luna. Without it, the
+  // route logs the search as a direct Ticketmaster search that bypassed the
+  // Luna limiter (TEA-52 observability). The route ignores it otherwise.
+  search.set("source", "luna");
 
   return search.toString();
 }

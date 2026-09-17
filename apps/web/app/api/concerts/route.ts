@@ -82,6 +82,18 @@ export async function GET(request: NextRequest) {
     );
   }
 
+  // TEA-52 observability. Structured searches go straight to Ticketmaster
+  // and never touch the Luna rate limiter. Luna's handoff tags itself with
+  // source=luna (see buildConcertsQuery), so it isn't counted here.
+  if (searchParams.get("source") !== "luna") {
+    console.info(
+      JSON.stringify({
+        event: "luna_rate_limit_bypass",
+        route: "direct_ticketmaster",
+      })
+    );
+  }
+
   try {
     const concerts = await searchConcerts({
       city,

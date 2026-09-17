@@ -1,6 +1,13 @@
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Location from 'expo-location';
+import { Platform } from 'react-native';
 
-import type { ConcertQueryBody, DeviceLocation } from '@jamspot/shared';
+import {
+  getOrCreateLunaSessionId,
+  LUNA_SESSION_ID_HEADER,
+  type ConcertQueryBody,
+  type DeviceLocation,
+} from '@jamspot/shared';
 
 import { supabase } from '@/lib/supabase';
 
@@ -12,7 +19,19 @@ import { supabase } from '@/lib/supabase';
  * function's own env and is never bundled into the app.
  */
 export async function invokeConcertQuery(body: ConcertQueryBody) {
-  return supabase.functions.invoke('concert-query', { body });
+  // A signed-in user's access token is sent automatically and is what the
+  // function rate-limits on. The session ID covers signed-out use (TEA-52).
+  // Expo's static web render has no storage (see src/lib/supabase.ts), so
+  // it uses the in-memory ID instead.
+  const isServerRender = Platform.OS === 'web' && typeof window === 'undefined';
+  const sessionId = await getOrCreateLunaSessionId(
+    isServerRender ? null : AsyncStorage,
+  );
+
+  return supabase.functions.invoke('concert-query', {
+    body,
+    headers: { [LUNA_SESSION_ID_HEADER]: sessionId },
+  });
 }
 
 /**
