@@ -6,6 +6,12 @@ All notable changes to JamSpot are documented in this file.
 
 ### Added
 
+- Server-side rate limiting for Luna searches (TEA-52). The `concert-query` Edge Function now decides first whether a request needs Luna, rejecting invalid requests before the limiter, and only then checks the caller's capacity. It returns HTTP `429` (`rate_limit_error` / `luna_rate_limit_exceeded`) with `Retry-After` and never calls the LLM for a rejected request. Limits come from `LUNA_RATE_LIMIT_MAX_REQUESTS` / `LUNA_RATE_LIMIT_WINDOW_SECONDS` (default 20 per 60 s), plus an optional `LUNA_RATE_LIMIT_IP_MAX_REQUESTS`, and can be changed without a code change.
+- `supabase/migrations/20260916120000_luna_rate_limits.sql`: the `luna_rate_limits` counter table (RLS on, no client access) and the `consume_luna_rate_limit` function. It counts a request against every bucket or none, in one transaction, and only `service_role` can execute it.
+- Rate-limit identity: signed-in users are limited by the verified Supabase user ID from their JWT (the function now accepts `auth: ["user", "publishable"]`). Anonymous users are limited by a per-device `x-jamspot-session-id` combined with their IP address, and each IP address also has a shared ceiling, so a client that makes up new session IDs is still limited. Bucket keys are SHA-256 hashes.
+- Structured logs for allowed, rejected and unavailable limiter checks, routing rejections, and direct Ticketmaster searches that bypass the limiter (`/api/concerts`, identified by the absence of `source=luna`).
+- Deno tests for allowed, rejected, window-reset, pre-Luna bypass, failed-provider counting, fail-closed, identity and log-redaction behavior, plus web tests for the client side.
+
 - Passwordless email-OTP authentication across both apps, against one shared Supabase project so the web and mobile clients have a single Auth user population. The user enters an email, `signInWithOtp` sends an 8-digit code, and `verifyOtp` with `type: "email"` exchanges it for a session — no passwords, no `signInWithPassword`, no reset flow. Sessions survive reload on web and app restart on mobile, and signing out clears the local session.
 - Auth is optional and additive: concert search and reviews remain fully usable signed out, with no route guards, redirects, or middleware. The only new affordance is a header control — `AuthNav` on web, `AuthButton` opening a sheet on mobile.
 - The framework-agnostic half of the flow — request, verify, sign out, email/code validation, and the user-facing wording for invalid email, failed send, invalid code, expired code, rate limiting, and network failure — in `@jamspot/shared`. It takes the client's `auth` object as a parameter rather than importing one, so no instantiated Supabase client is shared and the package stays free of browser-only and React-Native-only APIs.
@@ -14,6 +20,8 @@ All notable changes to JamSpot are documented in this file.
 
 ### Fixed
 
+- Luna on web now calls the Edge Function through the cookie-backed auth client, so a signed-in user's access token is actually sent. The plain client in `lib/supabase.ts` has no session, so it always sent the call anonymously.
+- `concert-query` returned a 500 for a JSON body that wasn't an object (such as `null`). It now returns a 400.
 - A stray `.env*` rule in `.gitignore` re-ignored `.env.example` after the earlier `!.env.example` whitelist, which would have made the new templates uncommittable. The negation is re-asserted after it rather than removing the rule.
 
 

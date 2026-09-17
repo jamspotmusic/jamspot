@@ -13,6 +13,13 @@
  * caller who won't share a location falls back to searching nationwide.
  */
 
+import {
+  logLunaEvent,
+  type LunaRateLimiter,
+  lunaRateLimitExceededResponse,
+  lunaRateLimitUnavailableResponse,
+} from "./rate-limit.ts";
+
 export const OPENAI_MODEL = "gpt-5.6-luna";
 
 /*
@@ -962,27 +969,154 @@ export function extractOutputText(
 }
 
 /* -------------------------------------------------------------------------
+ * Routing
+ *
+ *   request -> routing decision -> Luna required? -> rate-limit check -> Luna call
+ *
+ * Everything that can be decided without the model is decided here, before
+ * the rate limiter, so a malformed or out-of-scope request never uses up Luna
+ * capacity. Direct Ticketmaster searches (structured filters) go to
+ * /api/concerts and never reach this function.
+ * ---------------------------------------------------------------------- */
+
+export const MAX_QUERY_LENGTH = 500;
+
+export type LunaRequest = {
+  query: string;
+  timeZone: string;
+  callerLocation: CallerLocation;
+  geolocationDenied: boolean;
+};
+
+export type RouteDecision =
+  | { route: "luna"; request: LunaRequest }
+  | { route: "rejected"; reason: string; response: Response };
+
+function reject(
+  reason: string,
+  response: Response,
+): RouteDecision {
+  return { route: "rejected", reason, response };
+}
+
+/**
+ * Decides whether a request needs Luna. Reads the body only; the model is not
+ * involved, so nothing here costs a token.
+ */
+export async function decideRoute(req: Request): Promise<RouteDecision> {
+  if (req.method !== "POST") {
+    return reject(
+      "method_not_allowed",
+      Response.json(
+        { error: "Method not allowed" },
+        { status: 405, headers: { Allow: "POST" } },
+      ),
+    );
+  }
+
+  let body: RequestBody;
+
+  try {
+    body = await req.json();
+  } catch {
+    return reject(
+      "invalid_json",
+      Response.json(
+        { error: "Request body must contain valid JSON" },
+        { status: 400 },
+      ),
+    );
+  }
+
+  // `null`, an array, or a bare string is valid JSON but not a request.
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return reject(
+      "invalid_body",
+      Response.json(
+        { error: "Request body must be a JSON object" },
+        { status: 400 },
+      ),
+    );
+  }
+
+  const query = typeof body.query === "string" ? body.query.trim() : "";
+
+  if (!query) {
+    return reject(
+      "missing_query",
+      Response.json({ error: "query is required" }, { status: 400 }),
+    );
+  }
+
+  if (query.length > MAX_QUERY_LENGTH) {
+    return reject(
+      "query_too_long",
+      Response.json(
+        { error: `query must be ${MAX_QUERY_LENGTH} characters or fewer` },
+        { status: 400 },
+      ),
+    );
+  }
+
+  const timeZone = typeof body.timeZone === "string" && body.timeZone.trim()
+    ? body.timeZone.trim()
+    : "UTC";
+
+  return {
+    route: "luna",
+    request: {
+      query,
+      timeZone,
+      callerLocation: parseCallerLocation(body.location),
+      /*
+       * Set by a client that asked for the device's location and didn't get
+       * it - permission refused, geolocation unsupported, or the request
+       * timed out. It's the client's job to report this, because only the
+       * client knows whether it has asked yet.
+       */
+      geolocationDenied: body.geolocationDenied === true,
+    },
+  };
+}
+
+/* -------------------------------------------------------------------------
  * Handler
  * ---------------------------------------------------------------------- */
 
+export type ConcertQueryOptions = {
+  /**
+   * Verified Supabase user ID from the JWT (`ctx.userClaims.id`), or null
+   * for an anonymous caller. Never taken from the request body.
+   */
+  userId: string | null;
+  /** Checked after routing and before every Luna call. Required. */
+  rateLimiter: LunaRateLimiter;
+};
+
 export async function handleConcertQuery(
   req: Request,
+  { userId, rateLimiter }: ConcertQueryOptions,
 ): Promise<Response> {
-  if (req.method !== "POST") {
-    return Response.json(
-      { error: "Method not allowed" },
-      {
-        status: 405,
-        headers: {
-          Allow: "POST",
-        },
-      },
-    );
+  const decision = await decideRoute(req);
+
+  if (decision.route === "rejected") {
+    // Rejected before Luna, so the limiter never sees this request.
+    logLunaEvent({
+      event: "luna_route",
+      route: "rejected",
+      reason: decision.reason,
+    });
+    return decision.response;
   }
+
+  const { query, timeZone, callerLocation, geolocationDenied } =
+    decision.request;
 
   const apiKey = Deno.env.get("OPENAI_API_KEY");
 
   if (!apiKey) {
+    // Checked before the limiter: a request that can't reach Luna must not
+    // use up capacity.
     console.error(
       "OPENAI_API_KEY is not configured",
     );
@@ -996,58 +1130,18 @@ export async function handleConcertQuery(
     );
   }
 
-  let body: RequestBody;
-
-  try {
-    body = await req.json();
-  } catch {
-    return Response.json(
-      {
-        error:
-          "Request body must contain valid JSON",
-      },
-      { status: 400 },
-    );
-  }
-
-  const query =
-    typeof body.query === "string"
-      ? body.query.trim()
-      : "";
-
-  const timeZone =
-    typeof body.timeZone === "string" &&
-    body.timeZone.trim()
-      ? body.timeZone.trim()
-      : "UTC";
-
-  const callerLocation = parseCallerLocation(body.location);
-
   /*
-   * Set by a client that asked for the device's location and didn't get it -
-   * permission refused, geolocation unsupported, or the request timed out.
-   * It's the client's job to report this, because only the client knows
-   * whether it has asked yet.
+   * Checked immediately before the provider request. A rejected or
+   * unavailable result returns here: there is no other path to the model.
    */
-  const geolocationDenied = body.geolocationDenied === true;
+  const limit = await rateLimiter.check({ userId, headers: req.headers });
 
-  if (!query) {
-    return Response.json(
-      {
-        error: "query is required",
-      },
-      { status: 400 },
-    );
+  if (limit.outcome === "rejected") {
+    return lunaRateLimitExceededResponse(limit.retryAfterSeconds);
   }
 
-  if (query.length > 500) {
-    return Response.json(
-      {
-        error:
-          "query must be 500 characters or fewer",
-      },
-      { status: 400 },
-    );
+  if (limit.outcome === "unavailable") {
+    return lunaRateLimitUnavailableResponse();
   }
 
   const currentDateTime =
