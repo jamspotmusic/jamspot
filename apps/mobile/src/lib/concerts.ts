@@ -9,18 +9,14 @@ import { apiFetch } from '@/lib/api';
 
 const FALLBACK_IMAGE = 'https://picsum.photos/400/250?random=1';
 
-export async function searchConcerts(params: {
-  keyword?: string;
-  city?: string;
-  stateCode?: string;
-}): Promise<NormalizedConcert[]> {
-  const query = new URLSearchParams();
-  if (params.keyword) query.set('keyword', params.keyword);
-  if (params.city) query.set('city', params.city);
-  if (params.stateCode) query.set('stateCode', params.stateCode);
-
+/**
+ * Run a search that has already been resolved into a query string by
+ * `resolveConcertSearch` - the state-name bypass and Luna both produce one.
+ * Used to re-run the search on screen when the list is pulled to refresh.
+ */
+export async function fetchConcertSearch(search: string): Promise<NormalizedConcert[]> {
   const { concerts } = await apiFetch<{ concerts: NormalizedConcert[] }>(
-    `/api/concerts?${query.toString()}`,
+    `/api/concerts?${search}`,
   );
   return concerts;
 }
@@ -46,26 +42,6 @@ export async function getAppleMusicArtist(
     `/api/artist/apple-music?name=${encodeURIComponent(name)}`,
   );
   return artist;
-}
-
-/**
- * Same keyword-length gate and city-vs-stateCode heuristic as
- * apps/web/app/page.tsx's handleSearch/fetchConcerts, so mobile and web
- * search behave identically against the same API.
- */
-export function buildConcertSearchParams(keyword: string, location: string) {
-  const params: { keyword?: string; city?: string; stateCode?: string } = {};
-  if (keyword.length >= 3) {
-    params.keyword = keyword;
-  }
-  if (location) {
-    if (/^[a-z]{2}$/i.test(location)) {
-      params.stateCode = location.toUpperCase();
-    } else {
-      params.city = location;
-    }
-  }
-  return params;
 }
 
 /** Shape the UI renders. Derived from NormalizedConcert, same as web's CardEvent. */
@@ -147,26 +123,17 @@ export function isCompleteCardEvent(event: CardEvent): boolean {
   );
 }
 
+/**
+ * The genre chips are the only filter applied after the fetch, matching
+ * apps/web/app/page.tsx. The words in the search field are parameters the
+ * search was built from, so re-applying them to the response would drop
+ * events that match the search the user actually got.
+ */
 export function filterCardEvents(
   events: CardEvent[],
-  search: string,
-  location: string,
   activeGenre: string,
 ): CardEvent[] {
-  const query = search.trim().toLowerCase();
-  const normalizedLocation = location.trim().toLowerCase();
+  if (activeGenre === 'All') return events;
 
-  return events.filter((event) => {
-    const matchesGenre = activeGenre === 'All' || event.genre === activeGenre;
-    const searchableText = [event.artist, event.venue, event.city, event.state, event.genre]
-      .join(' ')
-      .toLowerCase();
-    const matchesSearch = !query || searchableText.includes(query);
-    const matchesLocation =
-      !normalizedLocation ||
-      event.city.toLowerCase().includes(normalizedLocation) ||
-      event.state.toLowerCase().includes(normalizedLocation);
-
-    return matchesGenre && matchesSearch && matchesLocation;
-  });
+  return events.filter((event) => event.genre === activeGenre);
 }

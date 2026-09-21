@@ -1,12 +1,12 @@
-import { Sparkles } from 'lucide-react-native';
+import { Search, Sparkles } from 'lucide-react-native';
 import { useState } from 'react';
 import { ActivityIndicator, Pressable, StyleSheet, TextInput, View } from 'react-native';
 
 import {
-  buildConcertsQuery,
-  interpretConcertQuery,
-  type ConcertQueryResponse,
+  classifySearchQuery,
+  resolveConcertSearch,
   type NormalizedConcert,
+  type ResolvedConcertSearch,
 } from '@jamspot/shared';
 
 import { ThemedText } from '@/components/themed-text';
@@ -15,70 +15,79 @@ import { useTheme } from '@/hooks/use-theme';
 import { ApiError, apiFetch } from '@/lib/api';
 import { invokeConcertQuery, requestDeviceLocation } from '@/lib/luna';
 
+/** The one search field the app has. */
+export const SEARCH_PLACEHOLDER = 'Ask Luna, or type a state...';
+
 /**
- * The mobile twin of apps/web/components/LunaSearch.tsx: a natural-language
- * concert search that goes through the `concert-query` Edge Function and then
- * hands the structured result to the same /api/concerts route the keyword
- * search already uses, so results render through the existing card list.
+ * The mobile twin of apps/web/components/LunaSearch.tsx, and the app's only
+ * search field (TEA-51).
  *
- * Styling follows components/search-field.tsx so the two inputs read as one
- * search area rather than a bolted-on second control.
+ * `resolveConcertSearch` decides what a line of text is: a bare state goes
+ * straight to Ticketmaster, anything else goes through the `concert-query`
+ * Edge Function, and anything that isn't a search is refused here without a
+ * request being sent. All three end at the same /api/concerts route the
+ * screen already renders from.
+ *
+ * Styling follows components/search-field.tsx, so the field looks the same as
+ * the two it replaced.
  */
 export function LunaSearch({
+  value,
+  onChangeValue,
   onSearchStart,
   onSearchSuccess,
   onSearchError,
 }: {
-  /** Fired before the concert request begins, so the screen can reset its
+  value: string;
+  onChangeValue: (value: string) => void;
+  /** Fired once a search is definitely running, so the screen can reset its
    *  own filters and show its loading state. */
   onSearchStart: (interpretation?: string) => void;
-  onSearchSuccess: (concerts: NormalizedConcert[]) => void;
+  /** `search` is the /api/concerts query string, kept so pull-to-refresh can
+   *  re-run exactly the search that is on screen. */
+  onSearchSuccess: (concerts: NormalizedConcert[], search: string) => void;
   onSearchError: (message: string) => void;
 }) {
   const theme = useTheme();
-  const [query, setQuery] = useState('');
-  const [isInterpreting, setIsInterpreting] = useState(false);
-  const [interpretError, setInterpretError] = useState<string | null>(null);
+  const [isSearching, setIsSearching] = useState(false);
+  const [inputError, setInputError] = useState<string | null>(null);
+
+  // A bare state skips the Edge Function, so the button shouldn't offer to
+  // ask Luna when nothing will be asked of her.
+  const isStateSearch = classifySearchQuery(value).kind === 'state';
 
   const submit = async () => {
-    const trimmed = query.trim();
+    setIsSearching(true);
+    setInputError(null);
 
-    if (!trimmed) {
-      setInterpretError("Describe the kind of show you're looking for.");
-      return;
-    }
-
-    setIsInterpreting(true);
-    setInterpretError(null);
-
-    let result: ConcertQueryResponse;
+    let resolved: ResolvedConcertSearch;
 
     try {
       const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
 
-      result = await interpretConcertQuery(
-        invokeConcertQuery,
-        trimmed,
+      resolved = await resolveConcertSearch(
+        value,
         timeZone,
+        invokeConcertQuery,
         requestDeviceLocation,
       );
     } catch (error) {
-      setIsInterpreting(false);
-      setInterpretError(
-        error instanceof Error ? error.message : 'Concert query failed.',
-      );
+      // Nothing has been searched yet - a refused query, an out-of-scope one,
+      // or a Luna failure. It belongs under the field rather than in place of
+      // results the user may still be looking at.
+      setIsSearching(false);
+      setInputError(error instanceof Error ? error.message : 'Concert search failed.');
       return;
     }
 
-    setIsInterpreting(false);
-    onSearchStart(result.interpretation);
+    setIsSearching(false);
+    onSearchStart(resolved.interpretation);
 
     try {
-      const search = buildConcertsQuery(result.ticketmasterParams, result.filters);
       const { concerts } = await apiFetch<{ concerts: NormalizedConcert[] }>(
-        `/api/concerts?${search}`,
+        `/api/concerts?${resolved.search}`,
       );
-      onSearchSuccess(concerts ?? []);
+      onSearchSuccess(concerts ?? [], resolved.search);
     } catch (error) {
       onSearchError(
         error instanceof ApiError ? error.message : 'Failed to load concerts.',
@@ -94,13 +103,18 @@ export function LunaSearch({
             styles.field,
             { backgroundColor: theme.backgroundElement, borderColor: theme.border },
           ]}>
-          <Sparkles size={15} color={theme.primary} />
+          {isStateSearch ? (
+            <Search size={15} color={theme.textSecondary} />
+          ) : (
+            <Sparkles size={15} color={theme.primary} />
+          )}
           <TextInput
-            value={query}
-            onChangeText={setQuery}
+            value={value}
+            onChangeText={onChangeValue}
             onSubmitEditing={submit}
-            editable={!isInterpreting}
-            placeholder="Ask Luna: chill jazz under $60..."
+            editable={!isSearching}
+            accessibilityLabel="Search concerts"
+            placeholder={SEARCH_PLACEHOLDER}
             placeholderTextColor={theme.textSecondary}
             autoCorrect={false}
             autoCapitalize="none"
@@ -111,27 +125,27 @@ export function LunaSearch({
 
         <Pressable
           onPress={submit}
-          disabled={isInterpreting}
+          disabled={isSearching}
           accessibilityRole="button"
-          accessibilityLabel="Ask Luna"
+          accessibilityLabel="Search concerts"
           style={({ pressed }) => [
             styles.button,
             { backgroundColor: theme.primary },
-            (pressed || isInterpreting) && styles.pressed,
+            (pressed || isSearching) && styles.pressed,
           ]}>
-          {isInterpreting ? (
+          {isSearching ? (
             <ActivityIndicator size="small" color={theme.primaryForeground} />
           ) : (
             <ThemedText style={[styles.buttonText, { color: theme.primaryForeground }]}>
-              Ask
+              {isStateSearch ? 'Search' : 'Ask'}
             </ThemedText>
           )}
         </Pressable>
       </View>
 
-      {interpretError && (
+      {inputError && (
         <ThemedText type="small" style={styles.error}>
-          {interpretError}
+          {inputError}
         </ThemedText>
       )}
     </View>
