@@ -26,41 +26,406 @@ export type NormalizedConcert = {
   priceRange: { min: number; max: number; currency: string } | null;
 };
 
+// ---------------------------------------------------------------------------
+// Concert reviews
+// ---------------------------------------------------------------------------
+//
+// Both apps create, edit, and delete reviews through the same Next.js API
+// routes, and both must refuse the same input for the same reasons. The rules
+// live here so the two clients cannot drift apart, and so the server can run
+// the exact validation the UI just ran rather than a second implementation of
+// it that might disagree.
+//
+// None of this is the security boundary. Ownership is enforced by Row Level
+// Security in supabase/migrations/*_reviews_ownership_and_rls.sql, and the
+// write rules are re-checked by database constraints and triggers; what is
+// here exists to reject bad input early and to say why in words a person can
+// act on.
+
+/** Lowest and highest star rating, inclusive. Ratings are whole numbers. */
+export const RATING_MIN = 1;
+export const RATING_MAX = 5;
+
+/**
+ * The optional per-aspect ratings a review may carry beside its overall one.
+ *
+ * Fixed set, fixed order: the DB has one nullable column per entry
+ * (`rating_<key>`), and both apps render them in this order. Adding one means
+ * a migration, so this array and the table stay in step.
+ */
+export const REVIEW_ASPECTS = [
+  { key: "performance", label: "Performance", hint: "The artist on stage" },
+  { key: "sound", label: "Sound", hint: "Mix and sound quality" },
+  { key: "venue", label: "Venue", hint: "The space itself" },
+  { key: "crowd", label: "Crowd", hint: "Atmosphere and energy" },
+  { key: "value", label: "Value", hint: "Worth the ticket price" },
+] as const;
+
+export type ReviewAspect = (typeof REVIEW_ASPECTS)[number]["key"];
+
+/** Column name on the `reviews` table holding a given aspect's rating. */
+export type ReviewAspectColumn = `rating_${ReviewAspect}`;
+
+export function aspectColumn(aspect: ReviewAspect): ReviewAspectColumn {
+  return `rating_${aspect}`;
+}
+
+/**
+ * Aspect ratings as the clients pass them around. An aspect that is absent or
+ * null is unrated, which is deliberately distinct from rating it 1.
+ */
+export type AspectRatings = Partial<Record<ReviewAspect, number | null>>;
+
 /**
  * Row shape of the `reviews` table.
  *
- * There is no `user_id` / accounts table - JamSpot has no authentication.
- * `user_name` is a plain, manually-entered text field, not a foreign key.
- *
- * Source of truth was apps/web/lib/reviews.ts.
+ * `user_id` is the authoritative owner - a Supabase Auth user id, and the
+ * value every ownership check is made against. `user_name` is a display-name
+ * snapshot taken when the review was written, denormalized on purpose so a
+ * review still renders the name it was published under.
  */
 export type Review = {
   id: string;
+  user_id: string;
+  user_name: string;
   musician: string;
   venue: string;
-  concert_date: string; // ISO date, e.g. "2026-05-01"
+  concert_date: string; // ISO calendar date, e.g. "2026-05-01"
+  rating: number;
+  rating_performance: number | null;
+  rating_sound: number | null;
+  rating_venue: number | null;
+  rating_crowd: number | null;
+  rating_value: number | null;
   review_text: string;
-  venue_city: string | null;
-  venue_state: string | null;
-  venue_country: string | null;
-  user_name: string | null;
   created_at: string;
+  updated_at: string;
 };
 
-/** Fields needed to create a new review. */
+/**
+ * Fields a client may send when creating a review.
+ *
+ * Note what is absent: the owner. `user_id` and `user_name` are taken from the
+ * authenticated session by the server, never from the request body, so there
+ * is no field here through which a client could post as somebody else.
+ */
 export type NewReview = {
   musician: string;
   venue: string;
   concertDate: string;
+  rating: number;
   reviewText: string;
-  venueCity?: string;
-  venueState?: string;
-  venueCountry?: string;
-  userName?: string;
+  aspectRatings?: AspectRatings;
 };
 
 /** Fields that can be changed on an existing review. All optional. */
 export type ReviewUpdate = Partial<NewReview>;
+
+/** A rejected field, paired with something worth showing the person. */
+export type ReviewFieldError = { field: string; message: string };
+
+export type ReviewValidation<T> =
+  | { ok: true; value: T }
+  | { ok: false; errors: ReviewFieldError[] };
+
+/**
+ * Today's calendar date in UTC, as "YYYY-MM-DD".
+ *
+ * UTC rather than the device's zone so that the browser, the phone, the API
+ * route, and the database trigger all agree on which day it is - the trigger
+ * compares against `(now() at time zone 'utc')::date`. A device just east or
+ * west of the line could otherwise be told a date is in the future by the
+ * server after the UI accepted it.
+ */
+export function todayIsoDate(now: Date = new Date()): string {
+  return now.toISOString().slice(0, 10);
+}
+
+const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * True for a real calendar date in "YYYY-MM-DD" form.
+ *
+ * The round-trip through Date catches values that match the pattern but do not
+ * exist, like "2026-02-31", which Date would otherwise roll forward to March.
+ */
+export function isValidIsoDate(value: string): boolean {
+  if (!ISO_DATE_PATTERN.test(value)) return false;
+  const parsed = new Date(`${value}T00:00:00Z`);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+}
+
+/**
+ * A concert can be reviewed on the day it happens, so this is a calendar-date
+ * comparison, not a timestamp one. Both sides are "YYYY-MM-DD", which sorts
+ * lexicographically in the same order it sorts chronologically.
+ */
+export function isFutureConcertDate(value: string, today: string = todayIsoDate()): boolean {
+  return value > today;
+}
+
+export function isValidRating(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= RATING_MIN && value <= RATING_MAX;
+}
+
+function trimmed(value: unknown): string | null {
+  return typeof value === "string" ? value.trim() : null;
+}
+
+const REQUIRED_TEXT_FIELDS = [
+  { field: "musician", label: "Artist or musician" },
+  { field: "venue", label: "Venue" },
+  { field: "reviewText", label: "Review" },
+] as const;
+
+/**
+ * Validate the aspect ratings bag, which may be absent entirely.
+ *
+ * An explicit null clears an aspect, which is how the edit form removes a
+ * rating it previously set; anything else must be a whole number in range.
+ */
+function validateAspectRatings(
+  raw: unknown,
+  errors: ReviewFieldError[],
+): AspectRatings | undefined {
+  if (raw === undefined || raw === null) return undefined;
+
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    errors.push({ field: "aspectRatings", message: "Aspect ratings must be an object." });
+    return undefined;
+  }
+
+  const source = raw as Record<string, unknown>;
+  const known = new Set<string>(REVIEW_ASPECTS.map((aspect) => aspect.key));
+
+  for (const key of Object.keys(source)) {
+    if (!known.has(key)) {
+      errors.push({ field: `aspectRatings.${key}`, message: `"${key}" is not a concert aspect.` });
+    }
+  }
+
+  const value: AspectRatings = {};
+
+  for (const aspect of REVIEW_ASPECTS) {
+    const given = source[aspect.key];
+    if (given === undefined || given === null) {
+      // Present-but-null means "clear it"; absent means "leave it alone". Both
+      // are recorded as null so the caller can send one shape to the database.
+      if (aspect.key in source) value[aspect.key] = null;
+      continue;
+    }
+    if (!isValidRating(given)) {
+      errors.push({
+        field: `aspectRatings.${aspect.key}`,
+        message: `${aspect.label} must be a whole number from ${RATING_MIN} to ${RATING_MAX}.`,
+      });
+      continue;
+    }
+    value[aspect.key] = given;
+  }
+
+  return value;
+}
+
+function validateConcertDate(raw: unknown, today: string, errors: ReviewFieldError[]): string | null {
+  const concertDate = trimmed(raw);
+
+  if (!concertDate) {
+    errors.push({ field: "concertDate", message: "Concert date is required." });
+    return null;
+  }
+  if (!isValidIsoDate(concertDate)) {
+    errors.push({ field: "concertDate", message: "Concert date must be a real date in YYYY-MM-DD form." });
+    return null;
+  }
+  if (isFutureConcertDate(concertDate, today)) {
+    errors.push({
+      field: "concertDate",
+      message: "You can only review a concert that has already happened.",
+    });
+    return null;
+  }
+  return concertDate;
+}
+
+function validateRating(raw: unknown, errors: ReviewFieldError[]): number | null {
+  if (raw === undefined || raw === null || raw === "") {
+    errors.push({ field: "rating", message: "An overall rating is required." });
+    return null;
+  }
+  if (!isValidRating(raw)) {
+    errors.push({
+      field: "rating",
+      message: `Rating must be a whole number from ${RATING_MIN} to ${RATING_MAX}.`,
+    });
+    return null;
+  }
+  return raw;
+}
+
+/**
+ * Owner fields are never accepted from a request body. Sending one is a
+ * mistake worth reporting rather than ignoring quietly, so that a client
+ * trying to attribute a review to someone else gets told no instead of
+ * silently having it rewritten.
+ */
+const OWNER_FIELDS = ["user_id", "userId", "user_name", "userName", "authorId", "author_id"];
+
+function rejectOwnerFields(input: Record<string, unknown>, errors: ReviewFieldError[]) {
+  for (const field of OWNER_FIELDS) {
+    if (input[field] !== undefined) {
+      errors.push({
+        field,
+        message: "A review's author is taken from your session and cannot be set or changed.",
+      });
+    }
+  }
+}
+
+function asRecord(input: unknown, errors: ReviewFieldError[]): Record<string, unknown> | null {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    errors.push({ field: "body", message: "Request body must be a JSON object." });
+    return null;
+  }
+  return input as Record<string, unknown>;
+}
+
+/** Everything a review needs, trimmed and type-checked. */
+export type ValidatedNewReview = {
+  musician: string;
+  venue: string;
+  concertDate: string;
+  rating: number;
+  reviewText: string;
+  aspectRatings: AspectRatings;
+};
+
+/**
+ * Validate a create request.
+ *
+ * `today` is injectable so tests can pin "now" and so a caller that already
+ * knows the current UTC day does not recompute it per field.
+ */
+export function validateNewReview(
+  input: unknown,
+  today: string = todayIsoDate(),
+): ReviewValidation<ValidatedNewReview> {
+  const errors: ReviewFieldError[] = [];
+  const body = asRecord(input, errors);
+  if (!body) return { ok: false, errors };
+
+  rejectOwnerFields(body, errors);
+
+  const text: Record<string, string> = {};
+  for (const { field, label } of REQUIRED_TEXT_FIELDS) {
+    const value = trimmed(body[field]);
+    if (!value) {
+      errors.push({ field, message: `${label} is required.` });
+    } else {
+      text[field] = value;
+    }
+  }
+
+  const concertDate = validateConcertDate(body.concertDate, today, errors);
+  const rating = validateRating(body.rating, errors);
+  const aspectRatings = validateAspectRatings(body.aspectRatings, errors);
+
+  if (errors.length > 0) return { ok: false, errors };
+
+  return {
+    ok: true,
+    value: {
+      musician: text.musician,
+      venue: text.venue,
+      concertDate: concertDate!,
+      rating: rating!,
+      reviewText: text.reviewText,
+      aspectRatings: aspectRatings ?? {},
+    },
+  };
+}
+
+/**
+ * Validate an edit request.
+ *
+ * Every rule that applies on create applies here too, but only to the fields
+ * actually being changed - a request that touches nothing but the venue should
+ * not be rejected for "missing" a rating it is not trying to change. An empty
+ * patch is refused rather than treated as a no-op, because it almost always
+ * means the caller sent the wrong shape.
+ */
+export function validateReviewUpdate(
+  input: unknown,
+  today: string = todayIsoDate(),
+): ReviewValidation<Partial<ValidatedNewReview>> {
+  const errors: ReviewFieldError[] = [];
+  const body = asRecord(input, errors);
+  if (!body) return { ok: false, errors };
+
+  rejectOwnerFields(body, errors);
+
+  const value: Partial<ValidatedNewReview> = {};
+
+  for (const { field, label } of REQUIRED_TEXT_FIELDS) {
+    if (body[field] === undefined) continue;
+    const text = trimmed(body[field]);
+    if (!text) {
+      errors.push({ field, message: `${label} cannot be blank.` });
+      continue;
+    }
+    (value as Record<string, unknown>)[field] = text;
+  }
+
+  if (body.concertDate !== undefined) {
+    const concertDate = validateConcertDate(body.concertDate, today, errors);
+    if (concertDate) value.concertDate = concertDate;
+  }
+
+  if (body.rating !== undefined) {
+    const rating = validateRating(body.rating, errors);
+    if (rating !== null) value.rating = rating;
+  }
+
+  if (body.aspectRatings !== undefined) {
+    const aspectRatings = validateAspectRatings(body.aspectRatings, errors);
+    if (aspectRatings) value.aspectRatings = aspectRatings;
+  }
+
+  if (errors.length > 0) return { ok: false, errors };
+
+  if (Object.keys(value).length === 0) {
+    return {
+      ok: false,
+      errors: [{ field: "body", message: "No changes were supplied." }],
+    };
+  }
+
+  return { ok: true, value };
+}
+
+/** Collapse field errors into one sentence, for an API `error` string. */
+export function describeReviewErrors(errors: ReviewFieldError[]): string {
+  return errors.map((error) => error.message).join(" ");
+}
+
+/**
+ * The aspect ratings a stored review actually carries, in display order,
+ * skipping the ones left unrated. Both clients render from this so an unrated
+ * aspect is absent rather than shown as zero stars.
+ */
+export function ratedAspects(
+  review: Pick<Review, ReviewAspectColumn>,
+): { aspect: ReviewAspect; label: string; rating: number }[] {
+  return REVIEW_ASPECTS.flatMap(({ key, label }) => {
+    const rating = review[aspectColumn(key)];
+    return typeof rating === "number" ? [{ aspect: key, label, rating }] : [];
+  });
+}
+
+/** Is this review owned by the signed-in user? Drives edit/delete affordances. */
+export function isReviewOwner(review: Pick<Review, "user_id">, userId: string | null | undefined): boolean {
+  return Boolean(userId) && review.user_id === userId;
+}
 
 /** Clean, front-end-friendly shape a Spotify artist is normalized into.
  *  Source of truth was apps/web/lib/spotify.ts. */

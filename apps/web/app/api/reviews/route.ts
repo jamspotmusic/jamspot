@@ -1,10 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
+import { describeReviewErrors, validateNewReview } from "@jamspot/shared";
+
+import { resolveDisplayName, resolveRequestIdentity } from "@/lib/api-auth";
 import { createReview, getReviews, ReviewsError } from "@/lib/reviews";
 
 /**
  * GET /api/reviews
  *
- * Returns every review, most recent first.
+ * Returns every review, most recent first. Open to anonymous callers.
  */
 export async function GET() {
   try {
@@ -24,13 +27,27 @@ export async function GET() {
 /**
  * POST /api/reviews
  *
- * Body: { musician, venue, concertDate, reviewText, venueCity?,
- *         venueState?, venueCountry?, userName? }
+ * Body: { musician, venue, concertDate, rating, reviewText, aspectRatings? }
  *
- * musician, venue, concertDate, and reviewText are required.
+ * Requires a signed-in user, supplied either as the web app's session cookie
+ * or as a `Authorization: Bearer <jwt>` header from the mobile app.
+ *
+ * The review's owner is taken from that session and is not readable from the
+ * body: there is no request that can create a review attributed to anyone but
+ * the caller. Sending `user_id` or `user_name` is rejected outright rather
+ * than ignored, so a client doing it finds out.
  */
 export async function POST(request: NextRequest) {
-  let body: Record<string, unknown>;
+  const identity = await resolveRequestIdentity(request);
+
+  if (!identity) {
+    return NextResponse.json(
+      { error: "You must be signed in to write a review." },
+      { status: 401 }
+    );
+  }
+
+  let body: unknown;
   try {
     body = await request.json();
   } catch {
@@ -40,44 +57,18 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  const { musician, venue, concertDate, reviewText } = body;
-
-  if (
-    typeof musician !== "string" ||
-    typeof venue !== "string" ||
-    typeof concertDate !== "string" ||
-    typeof reviewText !== "string" ||
-    !musician ||
-    !venue ||
-    !concertDate ||
-    !reviewText
-  ) {
+  const validation = validateNewReview(body);
+  if (!validation.ok) {
     return NextResponse.json(
-      {
-        error:
-          "musician, venue, concertDate, and reviewText are required strings",
-      },
+      { error: describeReviewErrors(validation.errors), fields: validation.errors },
       { status: 400 }
     );
   }
 
-  const venueCity = typeof body.venueCity === "string" ? body.venueCity : undefined;
-  const venueState =
-    typeof body.venueState === "string" ? body.venueState : undefined;
-  const venueCountry =
-    typeof body.venueCountry === "string" ? body.venueCountry : undefined;
-  const userName =
-    typeof body.userName === "string" ? body.userName : undefined;
-
   try {
-    const review = await createReview({
-      musician,
-      venue,
-      concertDate,
-      reviewText,
-      venueCity,
-      venueState,
-      venueCountry,
+    const userName = await resolveDisplayName(identity);
+    const review = await createReview(identity.supabase, validation.value, {
+      id: identity.user.id,
       userName,
     });
 

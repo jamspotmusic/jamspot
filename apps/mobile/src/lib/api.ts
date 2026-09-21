@@ -1,26 +1,17 @@
 import Constants from 'expo-constants';
+import type { NewReview, Review, ReviewFieldError, ReviewUpdate } from '@jamspot/shared';
+
+import { supabase } from '@/lib/supabase';
 
 /**
- * Shape of a row from the live `reviews` table, as actually returned by
- * GET /api/reviews today. This intentionally does NOT reuse the `Review`
- * type from @jamspot/shared: that type (and apps/web/lib/reviews.ts) still
- * describe an older schema (musician/venue/review_text/...) that no longer
- * matches the database, which now has star ratings and an author_id/profiles
- * relation. Once the shared type and web backend are reconciled with the
- * live schema, this can go back to importing from @jamspot/shared.
+ * Reviews now come from @jamspot/shared, which the database, the web app, and
+ * this app all agree on. (They used to diverge: the table had
+ * short_description/star_rating/author_id while the shared type still
+ * described musician/venue/review_text. The authenticated-reviews migration
+ * reconciled all three, so the local duplicate this file used to carry is
+ * gone.)
  */
-export type Review = {
-  id: string;
-  short_description: string;
-  description: string;
-  star_rating: number;
-  location: string;
-  review_date: string;
-  created_at: string;
-  updated_at: string;
-  author_id: string;
-  profiles: { username?: string; display_name?: string } | null;
-};
+export type { Review };
 
 /**
  * Production: jamspotmusic.app, served from Vercel through Cloudflare. The
@@ -119,13 +110,60 @@ function getApiBaseUrl(): Promise<string> {
   return apiBaseUrlPromise;
 }
 
-export class ApiError extends Error {}
+export class ApiError extends Error {
+  readonly status: number;
+  /** Per-field messages when the API rejected the input; empty otherwise. */
+  readonly fields: ReviewFieldError[];
 
-export async function apiFetch<T>(path: string): Promise<T> {
+  constructor(message: string, status = 0, fields: ReviewFieldError[] = []) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.fields = fields;
+  }
+
+  /** True when signing in (or signing in again) is what would fix this. */
+  get isAuthError() {
+    return this.status === 401;
+  }
+}
+
+type FetchOptions = {
+  method?: string;
+  body?: unknown;
+  /** Attach the signed-in user's access token. Required for every write. */
+  authenticated?: boolean;
+};
+
+/**
+ * There is no cookie jar in React Native, so the session travels as a bearer
+ * token instead - the transport apps/web/lib/api-auth.ts accepts alongside its
+ * own cookie session. The token is read per request rather than cached, so a
+ * refresh that happened since the screen mounted is picked up.
+ */
+async function authorizationHeader(): Promise<Record<string, string>> {
+  const { data } = await supabase.auth.getSession();
+  const token = data.session?.access_token;
+  if (!token) {
+    throw new ApiError('You must be signed in to do that.', 401);
+  }
+  return { Authorization: `Bearer ${token}` };
+}
+
+export async function apiFetch<T>(path: string, options: FetchOptions = {}): Promise<T> {
   const url = `${await getApiBaseUrl()}${path}`;
+  const headers: Record<string, string> = {};
+
+  if (options.body !== undefined) headers['content-type'] = 'application/json';
+  if (options.authenticated) Object.assign(headers, await authorizationHeader());
+
   let response: Response;
   try {
-    response = await fetch(url);
+    response = await fetch(url, {
+      method: options.method ?? 'GET',
+      headers,
+      body: options.body === undefined ? undefined : JSON.stringify(options.body),
+    });
   } catch {
     // Suggesting the dev server only makes sense when we're pointed at one.
     // The local branch is the only one that resolves to plain http, so a
@@ -138,12 +176,44 @@ export async function apiFetch<T>(path: string): Promise<T> {
     const body = await response.json().catch(() => null);
     // The URL, not just the path: when something other than the JamSpot API
     // is answering on this port, the host is the whole story.
-    throw new ApiError(body?.error ?? `Request to ${url} failed with status ${response.status}`);
+    throw new ApiError(
+      body?.error ?? `Request to ${url} failed with status ${response.status}`,
+      response.status,
+      Array.isArray(body?.fields) ? body.fields : [],
+    );
   }
-  return response.json();
+  // 204s carry no body; everything this app calls returns JSON, but be safe.
+  return response.status === 204 ? (undefined as T) : response.json();
 }
 
 export async function getReviews(): Promise<Review[]> {
   const { reviews } = await apiFetch<{ reviews: Review[] }>('/api/reviews');
   return reviews;
+}
+
+/**
+ * The three writes. Each requires a signed-in user, and the server decides
+ * ownership from that session - these never send a user id, and the API would
+ * reject one if they did.
+ */
+export async function createReview(input: NewReview): Promise<Review> {
+  const { review } = await apiFetch<{ review: Review }>('/api/reviews', {
+    method: 'POST',
+    body: input,
+    authenticated: true,
+  });
+  return review;
+}
+
+export async function updateReview(id: string, input: ReviewUpdate): Promise<Review> {
+  const { review } = await apiFetch<{ review: Review }>(`/api/reviews/${id}`, {
+    method: 'PATCH',
+    body: input,
+    authenticated: true,
+  });
+  return review;
+}
+
+export async function deleteReview(id: string): Promise<void> {
+  await apiFetch(`/api/reviews/${id}`, { method: 'DELETE', authenticated: true });
 }
