@@ -2,134 +2,105 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { Music2, Search } from "lucide-react";
+import { Music2, PenLine, Search } from "lucide-react";
+import { isReviewOwner, type Review } from "@jamspot/shared";
+
 import ReviewCard from "@/components/ReviewCard";
 import ReviewCardSkeleton from "@/components/ReviewCardSkeleton";
+import ReviewForm from "@/components/ReviewForm";
 import AuthNav from "@/components/AuthNav";
+import { useAuth } from "@/components/AuthProvider";
+import { ReviewRequestError, fetchReviews, removeReview } from "@/lib/reviews-client";
 
-export const mockReviews = [
-  {
-    id: "1",
-    author: "Sarah Mitchell",
-    rating: 4,
-    artist: "Massive Attack",
-    venue: "Golden 1 Center",
-    city: "Sacramento",
-    state: "CA",
-    content: "Amazing performance. The visuals were incredible and the sound quality was one of the best I've experienced at a live show.",
-    createdAt: "July 30, 2026",
-    upvotes: 127,
-    downvotes: 6,
-  },
-  {
-  id: "2",
-  author: "David Chen",
-  rating: 3,
-  artist: "The War on Drugs",
-  venue: "Ace of Spades",
-  city: "Sacramento",
-  state: "CA",
-  content:
-    "The band sounded great and the atmosphere was energetic. The guitar work was incredible, and the crowd was really engaged throughout the night. The only downside was that the venue felt a little cramped and it was difficult to get a good view unless you arrived early.",
-  createdAt: "July 28, 2026",
-  upvotes: 54,
-  downvotes: 3,
-},
-{
-  id: "3",
-  author: "Emily Rodriguez",
-  rating: 5,
-  artist: "Lana Del Rey",
-  venue: "Golden Gate Park",
-  city: "San Francisco",
-  state: "CA",
-  content:
-    "One of the most memorable concerts I've ever attended. The vocals were beautiful, the stage design was stunning, and the entire performance felt like a cinematic experience. Everything from the lighting to the setlist was thoughtfully done.",
-  createdAt: "July 24, 2026",
-  upvotes: 201,
-  downvotes: 9,
-},
-{
-  id: "4",
-  author: "Michael Thompson",
-  rating: 4,
-  artist: "Tame Impala",
-  venue: "Chase Center",
-  city: "San Francisco",
-  state: "CA",
-  content:
-    "The visuals were absolutely amazing and matched the music perfectly. The sound quality was excellent, and the band delivered a great performance. The only issue was that the lines for drinks were extremely long during the show.",
-  createdAt: "July 20, 2026",
-  upvotes: 89,
-  downvotes: 5,
-},
-{
-  id: "5",
-  author: "Olivia Martinez",
-  rating: 4,
-  artist: "Billie Eilish",
-  venue: "Golden 1 Center",
-  city: "Sacramento",
-  state: "CA",
-  content:
-    "Fantastic show from start to finish. Billie had incredible stage presence, and the crowd energy made the experience even better. The production quality was on another level, with amazing lighting and visuals that made every song feel unique.",
-  createdAt: "July 15, 2026",
-  upvotes: 342,
-  downvotes: 12,
-},
-];
+/**
+ * Matches the mobile screen's filter (apps/mobile/src/app/reviews.tsx): artist,
+ * venue, and author are searchable, but the review body deliberately is not -
+ * otherwise a common word matches nearly every review.
+ */
+function describeError(err: unknown, fallback: string) {
+    return err instanceof ReviewRequestError ? err.message : fallback;
+}
+
+export function filterReviews(reviews: Review[], query: string) {
+    const normalized = query.trim().toLowerCase();
+    if (!normalized) return reviews;
+    return reviews.filter((review) =>
+        [review.musician, review.venue, review.user_name]
+            .join(" ")
+            .toLowerCase()
+            .includes(normalized),
+    );
+}
 
 export default function ReviewsPage() {
+    const { user, status } = useAuth();
+
     const [searchInput, setSearchInput] = useState("");
+    const [query, setQuery] = useState("");
     const [isLoading, setIsLoading] = useState(true);
-    const [reviews, setReviews] = useState<typeof mockReviews>([]);
+    const [reviews, setReviews] = useState<Review[]>([]);
+    const [error, setError] = useState<string | null>(null);
 
+    // Which form is open: nothing, a new review, or an existing one.
+    const [composing, setComposing] = useState(false);
+    const [editing, setEditing] = useState<Review | null>(null);
+    // The review awaiting an explicit confirmation before it is removed.
+    const [pendingDelete, setPendingDelete] = useState<Review | null>(null);
+    const [deleting, setDeleting] = useState(false);
+
+    // State is only ever written from a .then()/.catch()/.finally() callback,
+    // never synchronously in the effect body - the same shape
+    // apps/mobile/src/app/reviews.tsx uses, and what this project's
+    // react-hooks/set-state-in-effect rule requires.
     useEffect(() => {
-        async function loadReviews() {
-            setIsLoading(true);
+        let cancelled = false;
 
-            try {
-                // Temporary mock data Replace this with API call later
-                setReviews(mockReviews);
-            } catch (error) {
-                console.error("Failed to load reviews:", error);
-            } finally {
-                setIsLoading(false);
-            }
-        }
+        fetchReviews()
+            .then((data) => {
+                if (cancelled) return;
+                setReviews(data);
+                setError(null);
+            })
+            .catch((err) => {
+                if (cancelled) return;
+                setError(describeError(err, "Something went wrong loading reviews."));
+            })
+            .finally(() => {
+                if (!cancelled) setIsLoading(false);
+            });
 
-        loadReviews();
+        return () => {
+            cancelled = true;
+        };
     }, []);
 
-    const handleSearch = async (e: React.SyntheticEvent<HTMLFormElement>) => {
-        e.preventDefault();
+    function handleSaved(saved: Review) {
+        setReviews((previous) => {
+            const existing = previous.findIndex((review) => review.id === saved.id);
+            if (existing === -1) return [saved, ...previous];
+            return previous.map((review) => (review.id === saved.id ? saved : review));
+        });
+        setComposing(false);
+        setEditing(null);
+    }
 
-        setIsLoading(true);
-
+    async function confirmDelete() {
+        if (!pendingDelete) return;
+        setDeleting(true);
         try {
-            const query = searchInput.toLowerCase().trim();
-
-            const filtered = mockReviews.filter((review) => {
-                const searchableText = [
-                    review.artist,
-                    review.venue,
-                    review.city,
-                    review.state,
-                    `${review.city}, ${review.state}`,
-                ]
-                    .join(" ")
-                    .toLowerCase();
-
-                return searchableText.includes(query);
-            });
-            setReviews(filtered);
-        } catch (error) {
-            console.error("Failed to search reviews:", error);
-            setReviews([]);
+            await removeReview(pendingDelete.id);
+            setReviews((previous) => previous.filter((review) => review.id !== pendingDelete.id));
+            setPendingDelete(null);
+        } catch (err) {
+            setError(describeError(err, "Something went wrong deleting your review."));
+            setPendingDelete(null);
         } finally {
-            setIsLoading(false);
+            setDeleting(false);
         }
-    };
+    }
+
+    const visible = filterReviews(reviews, query);
+    const formOpen = composing || editing !== null;
 
     return (
         <>
@@ -169,23 +140,26 @@ export default function ReviewsPage() {
 
                             <AuthNav />
                         </div>
-                        
+
                         {/* Search */}
                         <form
-                            onSubmit={handleSearch}
+                            onSubmit={(e) => {
+                                e.preventDefault();
+                                setQuery(searchInput);
+                            }}
                             className="w-full sm:w-auto"
                         >
                             <div className="flex items-center gap-2 rounded-lg border border-border bg-muted px-3 py-2 sm:w-96">
                                 <Search size={15} className="text-muted-foreground shrink-0" />
 
-                                <input 
+                                <input
                                     type="text"
                                     name="review-search"
                                     value={searchInput}
                                     onChange={(e) => setSearchInput(e.target.value)}
-                                    placeholder="Search by artist, venue, or location..."
+                                    placeholder="Search by artist, venue, or reviewer..."
                                     className="w-full bg-transparent outline-none text-foreground placeholder:text-muted-foreground"
-                                    /> 
+                                    />
                             </div>
                         </form>
                     </div>
@@ -194,7 +168,7 @@ export default function ReviewsPage() {
 
             <main className="mx-auto max-w-3xl space-y-6 p-6 text-foreground">
                 {/* Reviews heading */}
-                <div className="flex items-baseline justify-between">
+                <div className="flex items-baseline justify-between gap-4">
                     <h1
                         className="text-lg font-bold text-foreground"
                         style={{
@@ -205,13 +179,59 @@ export default function ReviewsPage() {
                         Reviews
                     </h1>
 
-                    <span
-                        className="text-sm text-muted-foreground"
-                        style={{ fontFamily: "'DM Mono', monospace" }}
-                    >
-                        {reviews.length} review{reviews.length !== 1 ? "s" : ""}
-                    </span>
+                    <div className="flex items-center gap-4">
+                        <span
+                            className="text-sm text-muted-foreground"
+                            style={{ fontFamily: "'DM Mono', monospace" }}
+                        >
+                            {visible.length} review{visible.length !== 1 ? "s" : ""}
+                        </span>
+
+                        {/* Writing needs an account, so signed-out visitors are
+                            pointed at sign-in rather than shown a form that
+                            would fail on submit. */}
+                        {status === "authenticated" ? (
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    setEditing(null);
+                                    setComposing(true);
+                                }}
+                                className="flex items-center gap-2 rounded-full bg-primary px-4 py-1.5 text-sm font-medium text-white transition-opacity hover:opacity-90 cursor-pointer"
+                            >
+                                <PenLine size={14} />
+                                Write a review
+                            </button>
+                        ) : status === "unauthenticated" ? (
+                            <Link
+                                href="/sign-in"
+                                className="flex items-center gap-2 rounded-full border border-border bg-muted px-4 py-1.5 text-sm font-medium text-muted-foreground transition-colors hover:text-foreground"
+                            >
+                                <PenLine size={14} />
+                                Sign in to review
+                            </Link>
+                        ) : null}
+                    </div>
                 </div>
+
+                {error && (
+                    <p role="alert" className="rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-300">
+                        {error}
+                    </p>
+                )}
+
+                {formOpen && (
+                    <div className="rounded-xl border border-border bg-card p-6">
+                        <ReviewForm
+                            review={editing ?? undefined}
+                            onSaved={handleSaved}
+                            onCancel={() => {
+                                setComposing(false);
+                                setEditing(null);
+                            }}
+                        />
+                    </div>
+                )}
 
                 {/* Reviews Cards */}
                 <div className="space-y-4">
@@ -219,11 +239,17 @@ export default function ReviewsPage() {
                         Array.from({ length: 3 }).map((_, index) => (
                             <ReviewCardSkeleton key={index} />
                         ))
-                    ) : reviews.length > 0 ? (
-                        reviews.map((review) => (
+                    ) : visible.length > 0 ? (
+                        visible.map((review) => (
                             <ReviewCard
                                 key={review.id}
                                 review={review}
+                                canManage={isReviewOwner(review, user?.id)}
+                                onEdit={(target) => {
+                                    setComposing(false);
+                                    setEditing(target);
+                                }}
+                                onDelete={setPendingDelete}
                             />
                         ))
                     ) : (
@@ -233,6 +259,44 @@ export default function ReviewsPage() {
                     )}
                 </div>
             </main>
+
+            {/* Deleting is permanent, so it takes a second, explicit action. */}
+            {pendingDelete && (
+                <div
+                    role="dialog"
+                    aria-modal="true"
+                    aria-labelledby="delete-review-title"
+                    className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+                >
+                    <div className="w-full max-w-sm rounded-xl border border-border bg-card p-6 text-foreground">
+                        <h2 id="delete-review-title" className="text-lg font-bold">
+                            Delete this review?
+                        </h2>
+                        <p className="mt-2 text-sm text-muted-foreground">
+                            Your review of {pendingDelete.musician} at {pendingDelete.venue} will be
+                            permanently removed. This cannot be undone.
+                        </p>
+                        <div className="mt-6 flex justify-end gap-3">
+                            <button
+                                type="button"
+                                onClick={() => setPendingDelete(null)}
+                                disabled={deleting}
+                                className="rounded-full border border-border bg-muted px-4 py-2 text-sm font-medium text-muted-foreground transition-colors hover:text-foreground disabled:opacity-50 cursor-pointer"
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                type="button"
+                                onClick={confirmDelete}
+                                disabled={deleting}
+                                className="rounded-full bg-red-600 px-4 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50 cursor-pointer"
+                            >
+                                {deleting ? "Deleting…" : "Delete review"}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
         </>
     )
 }

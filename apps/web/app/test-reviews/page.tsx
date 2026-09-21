@@ -1,67 +1,63 @@
-import { createReview, getReviewById, ReviewsError } from "@/lib/reviews";
+import { getReviewById, getReviews, ReviewsError } from "@/lib/reviews";
 
 /**
- * Temporary connection-test route for the reviews table, following the
- * same pattern as /test-db and /test-concerts.
+ * Temporary connection-test route for the reviews table, following the same
+ * pattern as /test-db and /test-concerts.
  *
- * On every load this WRITES a real row to `reviews` (via createReview)
- * and then READS it back by id (via getReviewById) to confirm the full
- * round trip works. It cannot clean up after itself: the RLS policy on
- * `reviews` only grants anon SELECT and INSERT, not DELETE, so the test
- * row stays in the table. Remove this route (or periodically delete rows
- * where user_name = 'test-reviews route') before sharing the app publicly.
+ * This used to write a real row on every load, which worked only because the
+ * old RLS policy let anonymous callers INSERT. Authenticated reviews removed
+ * that policy on purpose - writing now requires a signed-in user who owns the
+ * row - so the check is read-only: it lists reviews and reads the first one
+ * back by id, which is enough to confirm the table is reachable and shaped the
+ * way the app expects. Creating a review is covered by the automated tests and
+ * by the reviews page itself.
  */
+// A connection check is only useful if it runs now, not at build time.
+export const dynamic = "force-dynamic";
+
 export default async function TestReviewsPage() {
-  let created: Awaited<ReturnType<typeof createReview>> | null = null;
-  let fetched: Awaited<ReturnType<typeof getReviewById>> | null = null;
+  let reviews: Awaited<ReturnType<typeof getReviews>> = [];
+  let fetched: Awaited<ReturnType<typeof getReviewById>> = null;
   let error: string | null = null;
 
   try {
-    created = await createReview({
-      musician: "RLS Test Artist",
-      venue: "Automated Test Venue",
-      concertDate: new Date().toISOString().slice(0, 10),
-      reviewText: `Automated read/write check at ${new Date().toISOString()}`,
-      userName: "test-reviews route",
-    });
-
-    fetched = await getReviewById(created.id);
-
-    if (!fetched) {
-      error = "Review was created but could not be read back by id";
+    reviews = await getReviews();
+    if (reviews.length > 0) {
+      fetched = await getReviewById(reviews[0].id);
+      if (!fetched) {
+        error = "A review was listed but could not be read back by id";
+      }
     }
   } catch (err) {
     error = err instanceof ReviewsError ? err.message : "Unexpected error";
   }
 
-  const success = !error && created !== null && fetched !== null;
+  const success = !error;
 
   return (
     <main className="p-8">
       <h1 className="text-2xl font-bold">
-        {success
-          ? "JamSpot can read and write reviews"
-          : "Reviews read/write test failed"}
+        {success ? "JamSpot can read reviews" : "Reviews read test failed"}
       </h1>
 
       <p className="mt-2 text-sm text-gray-600">
-        This route writes a real row to the reviews table on every load and
-        cannot delete it (RLS blocks anon deletes by design). Remove this
-        route, or periodically clear test rows, before sharing this app
-        publicly.
+        Read-only. Writing a review requires an authenticated owner, so this
+        route no longer creates rows and leaves nothing behind.
       </p>
 
       {error ? (
         <pre className="mt-4 whitespace-pre-wrap">{error}</pre>
       ) : (
         <>
-          <h2 className="mt-4 font-semibold">Write result (created row):</h2>
+          <h2 className="mt-4 font-semibold">
+            List result ({reviews.length} review{reviews.length === 1 ? "" : "s"}):
+          </h2>
           <pre className="mt-2 whitespace-pre-wrap">
-            {JSON.stringify(created, null, 2)}
+            {JSON.stringify(reviews.slice(0, 3), null, 2)}
           </pre>
 
           <h2 className="mt-4 font-semibold">
-            Read result (same row, fetched back by id):
+            Read result (first row, fetched back by id):
           </h2>
           <pre className="mt-2 whitespace-pre-wrap">
             {JSON.stringify(fetched, null, 2)}
