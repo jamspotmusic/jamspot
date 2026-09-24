@@ -40,9 +40,19 @@ export const initialFetchState = <T,>(): FetchState<T> => ({
 export default function ConcertModal({
   event,
   onClose,
+  onTicketClick,
 }: {
   event: ConcertModalEvent | null;
   onClose: () => void;
+  /**
+   * Fired when the ticket CTA is clicked, before the browser follows the link.
+   *
+   * Notification only - it does not gate, rewrite, or preventDefault the
+   * navigation. The discovery pages (TEA-67) use it to record that an organic
+   * visit reached Ticketmaster; the link itself is untouched, so the CTA
+   * behaves identically whether or not anything is listening.
+   */
+  onTicketClick?: (event: ConcertModalEvent) => void;
 }) {
   // TEA-22: Last.fm artist biography
   const [bio, setBio] = useState<FetchState<NormalizedArtistBio | null>>(
@@ -193,6 +203,9 @@ export default function ConcertModal({
               href={event.ticketUrl ?? undefined}
               target="_blank"
               rel="noreferrer"
+              onClick={() => {
+                if (event.ticketUrl) onTicketClick?.(event);
+              }}
               aria-disabled={!event.ticketUrl}
               className={`flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-lg transition-all border ${
                 event.ticketUrl

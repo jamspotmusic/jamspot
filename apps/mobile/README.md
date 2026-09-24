@@ -25,6 +25,31 @@ In the output, you'll find options to open the app in a
 
 You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
 
+## Signing in
+
+Passwordless email OTP against the same Supabase project the web app uses, so
+one account works on both. Auth is optional — search and reviews work fully
+signed out; the Sign in button in the header is the only addition.
+
+Copy the template and fill it in before running the app:
+
+```bash
+cp .env.example .env
+```
+
+```env
+EXPO_PUBLIC_SUPABASE_URL=
+EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY=
+```
+
+Both are public by design (`EXPO_PUBLIC_*` is embedded in the app bundle). Never
+put a service-role key, database password, or JWT secret here.
+
+The client (`src/lib/supabase.ts`) persists the session with AsyncStorage, so it
+survives app restarts, and starts/stops Supabase's token refresh with React
+Native's `AppState` so the timer isn't left running in the background. See the
+root README for how the flow works end to end.
+
 ## Which API the app talks to
 
 The web app's routes under `/api` are the backend for both clients. `getApiBaseUrl`

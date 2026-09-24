@@ -17,10 +17,23 @@
     "noCheck": true
   },
   "include": [
+    "proxy.ts",
     "app/page.tsx",
     "app/test-concert-query/page.tsx",
+    "app/concerts/[city]/page.tsx",
+    "app/concerts/[city]/[genre]/page.tsx",
+    "app/artists/[artistSlug]/page.tsx",
+    "app/venues/[venueSlug]/page.tsx",
+    "app/sitemap.ts",
+    "app/robots.ts",
     "components/ConcertModal.tsx",
+    "components/EventCard.tsx",
     "components/StreamingServiceLinks.tsx",
+    "components/SignInForm.tsx",
+    "components/LunaSearch.tsx",
+    "components/discovery/DiscoveryEventGrid.tsx",
+    "components/discovery/DiscoveryLayout.tsx",
+    "components/discovery/JsonLd.tsx",
     "tests/unit/**/*.ts"
   ],
   "exclude": [

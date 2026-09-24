@@ -78,12 +78,24 @@ const baseEvent = {
   ticketUrl: "https://tickets.example.com/nova",
 };
 
+// Order matters: this array is consumed positionally by the useState stub,
+// so it must track the order the hooks appear in app/page.tsx.
+const HOME_STATE_INDEX = {
+  query: 0,
+  activeGenre: 1,
+  hasSearched: 2,
+  isLoadingMore: 3,
+  events: 4,
+  selectedEvent: 5,
+  isLoading: 6,
+  fetchError: 7,
+  visibleCount: 8,
+  searchInterpretation: 9,
+};
+
 function homeState(overrides = {}) {
   return [
-    overrides.searchInput ?? "",
-    overrides.search ?? "",
-    overrides.locationInput ?? "",
-    overrides.location ?? "",
+    overrides.query ?? "",
     overrides.activeGenre ?? "All",
     overrides.hasSearched ?? false,
     overrides.isLoadingMore ?? false,
@@ -92,14 +104,12 @@ function homeState(overrides = {}) {
     overrides.isLoading ?? false,
     overrides.fetchError ?? null,
     overrides.visibleCount ?? 6,
+    overrides.searchInterpretation ?? null,
   ];
 }
 
-test("Home handlers update search state, filters, cards, tickets, and pagination", async () => {
-  const originalFormData = global.FormData;
-  const originalSetTimeout = global.setTimeout;
+test("Home reacts to the one search field, and to chips, cards, and paging", async () => {
   const originalWindow = global.window;
-  const originalFetch = global.fetch;
   const opened = [];
 
   global.window = {
@@ -107,112 +117,106 @@ test("Home handlers update search state, filters, cards, tickets, and pagination
     addEventListener: () => undefined,
     removeEventListener: () => undefined,
   };
-  global.setTimeout = (callback) => {
-    callback();
-    return 1;
-  };
-  global.FormData = class FormDataStub {
-    get(name) {
-      return name === "search" ? "  rock  " : "  Dallas  ";
-    }
-  };
-  global.fetch = async () =>
-    jsonResponse({
-      concerts: [
-        {
-          id: "api-event",
-          name: "API Event",
-          artist: "API Artist",
-          venue: "API Venue",
-          city: "Dallas",
-          state: "TX",
-          date: "2026-09-15T12:00:00Z",
-          time: "19:30:00",
-          imageUrl: null,
-          ticketUrl: null,
-          genre: "Rock",
-          subGenre: null,
-          priceRange: null,
-        },
-      ],
-    });
 
   const events = Array.from({ length: 7 }, (_, index) => ({
     ...baseEvent,
     id: `event-${index}`,
     artist: `Nova Bloom ${index}`,
   }));
-  const hooks = installHookHarness(
-    homeState({
-      search: "rock",
-      location: "tx",
-      hasSearched: true,
-      events,
-    }),
-  );
+  const hooks = installHookHarness(homeState({ hasSearched: true, events }));
 
   try {
     const page = require("../../.ui-test-build/app/page.js");
+    const LunaSearch = require("../../.ui-test-build/components/LunaSearch.js").default;
     const tree = page.default();
 
-    const searchInput = findElements(
-      tree,
-      (element) => element.props.placeholder === "Artist, venue, event, or genre...",
-    )[0];
-    const locationInput = findElements(
-      tree,
-      (element) => element.props.placeholder === "City or state",
-    )[0];
-    searchInput.props.onChange({ target: { value: "jazz" } });
-    locationInput.props.onChange({ target: { value: "Austin" } });
-    assert.equal(hooks.setterCalls[0].at(-1), "jazz");
-    assert.equal(hooks.setterCalls[2].at(-1), "Austin");
+    // Once a search has been run the field lives in the header, and there is
+    // exactly one of it (TEA-51).
+    const fields = findElements(tree, (element) => element.type === LunaSearch);
+    assert.equal(fields.length, 1);
+    assert.equal(fields[0].props.variant, "header");
 
-    let prevented = 0;
-    let submitted = 0;
-    searchInput.props.onKeyDown({
-      key: "Tab",
-      preventDefault: () => prevented++,
-      currentTarget: { form: { requestSubmit: () => submitted++ } },
-    });
-    searchInput.props.onKeyDown({
-      key: "Enter",
-      preventDefault: () => prevented++,
-      currentTarget: { form: { requestSubmit: () => submitted++ } },
-    });
-    assert.equal(prevented, 1);
-    assert.equal(submitted, 1);
+    const field = fields[0];
+    field.props.onChange("Texas");
+    assert.equal(hooks.setterCalls[HOME_STATE_INDEX.query].at(-1), "Texas");
 
-    const form = findElements(tree, (element) => element.type === "form")[0];
-    form.props.onSubmit({ preventDefault: () => prevented++, currentTarget: {} });
-    assert.equal(hooks.setterCalls[1].at(-1), "rock");
-    assert.equal(hooks.setterCalls[3].at(-1), "Dallas");
-    assert.equal(hooks.setterCalls[5].at(-1), true);
-    assert.equal(hooks.setterCalls[4].at(-1), "Rock");
+    // A search is starting: filters reset, the results view takes over, and
+    // the interpretation the field resolved is what gets shown above them.
+    field.props.onSearchStart("Upcoming live music across Texas.");
+    assert.equal(hooks.setterCalls[HOME_STATE_INDEX.hasSearched].at(-1), true);
+    assert.equal(hooks.setterCalls[HOME_STATE_INDEX.isLoading].at(-1), true);
+    assert.equal(hooks.setterCalls[HOME_STATE_INDEX.activeGenre].at(-1), "All");
+    assert.equal(hooks.setterCalls[HOME_STATE_INDEX.visibleCount].at(-1), 6);
+    assert.deepEqual(hooks.setterCalls[HOME_STATE_INDEX.events].at(-1), []);
+    assert.equal(hooks.setterCalls[HOME_STATE_INDEX.fetchError].at(-1), null);
+    assert.equal(
+      hooks.setterCalls[HOME_STATE_INDEX.searchInterpretation].at(-1),
+      "Upcoming live music across Texas.",
+    );
+
+    // A search with no interpretation leaves that line off entirely.
+    field.props.onSearchStart();
+    assert.equal(
+      hooks.setterCalls[HOME_STATE_INDEX.searchInterpretation].at(-1),
+      null,
+    );
+
+    field.props.onSearchSuccess([
+      {
+        id: "api-event",
+        name: "API Event",
+        artist: "API Artist",
+        venue: "API Venue",
+        city: "Dallas",
+        state: "TX",
+        date: "2026-09-15T12:00:00Z",
+        time: "19:30:00",
+        imageUrl: null,
+        ticketUrl: null,
+        genre: "Rock",
+        subGenre: null,
+        priceRange: null,
+      },
+    ]);
+    assert.equal(
+      hooks.setterCalls[HOME_STATE_INDEX.events].at(-1)[0].artist,
+      "API Artist",
+    );
+    assert.equal(hooks.setterCalls[HOME_STATE_INDEX.isLoading].at(-1), false);
+
+    field.props.onSearchError("Ticketmaster is unavailable");
+    assert.equal(
+      hooks.setterCalls[HOME_STATE_INDEX.fetchError].at(-1),
+      "Ticketmaster is unavailable",
+    );
+    assert.deepEqual(hooks.setterCalls[HOME_STATE_INDEX.events].at(-1), []);
 
     const rockButton = findElements(
       tree,
       (element) => element.type === "button" && element.props.children === "Rock",
     )[0];
     rockButton.props.onClick();
-    assert.equal(hooks.setterCalls[4].at(-1), "Rock");
-    assert.equal(hooks.setterCalls[11].at(-1), 6);
+    assert.equal(hooks.setterCalls[HOME_STATE_INDEX.activeGenre].at(-1), "Rock");
+    assert.equal(hooks.setterCalls[HOME_STATE_INDEX.visibleCount].at(-1), 6);
 
     const showMore = findElements(
       tree,
       (element) => element.type === "button" && element.props.children === "Show more",
     )[0];
     showMore.props.onClick();
-    assert.equal(hooks.setterCalls[6][0], true);
-    assert.equal(hooks.setterCalls[11].at(-1)(6), 12);
-    assert.equal(hooks.setterCalls[6].at(-1), false);
+    assert.equal(hooks.setterCalls[HOME_STATE_INDEX.isLoadingMore][0], true);
+    assert.equal(hooks.setterCalls[HOME_STATE_INDEX.visibleCount].at(-1)(6), 12);
+    assert.equal(hooks.setterCalls[HOME_STATE_INDEX.isLoadingMore].at(-1), false);
 
     const eventCardElement = findElements(
       tree,
       (element) => element.type === page.EventCard,
     )[0];
     eventCardElement.props.onOpen(baseEvent);
-    assert.deepEqual(hooks.setterCalls[8].at(-1), baseEvent);
+    assert.deepEqual(
+      hooks.setterCalls[HOME_STATE_INDEX.selectedEvent].at(-1),
+      baseEvent,
+    );
     eventCardElement.props.onTicketClick(baseEvent);
     eventCardElement.props.onTicketClick({ ...baseEvent, ticketUrl: null });
     assert.deepEqual(opened, [
@@ -220,59 +224,135 @@ test("Home handlers update search state, filters, cards, tickets, and pagination
     ]);
 
     await flushPromises();
-    assert.equal(hooks.setterCalls[9][0], true);
-    assert.equal(hooks.setterCalls[10][0], null);
-    assert.equal(hooks.setterCalls[7].at(-1)[0].artist, "API Artist");
-    assert.equal(hooks.setterCalls[9].at(-1), false);
-    assert.equal(hooks.cleanups.length, 1);
-    hooks.cleanups[0]();
+    // Nothing is fetched from the page itself any more - the field owns the
+    // request - so there is no effect left to clean up.
+    assert.equal(hooks.cleanups.length, 0);
   } finally {
     hooks.restore();
-    global.FormData = originalFormData;
-    global.setTimeout = originalSetTimeout;
     global.window = originalWindow;
+  }
+});
+
+test("Home puts the search field in the hero until the first search", () => {
+  const hooks = installHookHarness(homeState({ hasSearched: false }));
+
+  try {
+    const page = require("../../.ui-test-build/app/page.js");
+    const LunaSearch = require("../../.ui-test-build/components/LunaSearch.js").default;
+    const tree = page.default();
+
+    const fields = findElements(tree, (element) => element.type === LunaSearch);
+    assert.equal(fields.length, 1);
+    assert.equal(fields[0].props.variant, "hero");
+  } finally {
+    hooks.restore();
+  }
+});
+
+test("the search field resolves a bare state without asking Luna", async () => {
+  const originalFetch = global.fetch;
+  const requestedUrls = [];
+  const started = [];
+  const succeeded = [];
+
+  global.fetch = async (url) => {
+    requestedUrls.push(String(url));
+    return jsonResponse({ concerts: [] });
+  };
+
+  const hooks = installHookHarness([false, null]);
+
+  try {
+    const LunaSearch = require("../../.ui-test-build/components/LunaSearch.js").default;
+    const tree = LunaSearch({
+      value: "Texas",
+      onChange: () => undefined,
+      onSearchStart: (interpretation) => started.push(interpretation),
+      onSearchSuccess: (concerts) => succeeded.push(concerts),
+      onSearchError: () => assert.fail("state search should not error"),
+    });
+
+    const form = findElements(tree, (element) => element.type === "form")[0];
+    await form.props.onSubmit({ preventDefault: () => undefined });
+
+    // Straight to Ticketmaster: no Edge Function invocation, and the state
+    // arrives as a stateCode rather than as free text.
+    assert.equal(requestedUrls.length, 1);
+    assert.match(requestedUrls[0], /^\/api\/concerts\?/);
+    assert.match(requestedUrls[0], /stateCode=TX/);
+    assert.match(requestedUrls[0], /countryCode=US/);
+    assert.deepEqual(started, ["Upcoming live music across Texas."]);
+    assert.deepEqual(succeeded, [[]]);
+
+    // And the button says so, rather than offering to ask Luna.
+    const button = findElements(tree, (element) => element.type === "button")[0];
+    assert.equal(button.props.children, "Search");
+  } finally {
+    hooks.restore();
     global.fetch = originalFetch;
   }
 });
 
-test("Home concert loading handles city queries, API failures, and aborts", async () => {
+test("the search field refuses input that isn't a search, without a request", async () => {
   const originalFetch = global.fetch;
-  const requestedUrls = [];
-
-  global.fetch = async (url) => {
-    requestedUrls.push(String(url));
-    return jsonResponse({ error: "Concert service unavailable" }, false);
-  };
-  const failureHooks = installHookHarness(
-    homeState({ search: "nova", location: "Dallas", hasSearched: true }),
-  );
-  try {
-    const page = require("../../.ui-test-build/app/page.js");
-    page.default();
-    await flushPromises();
-    assert.match(requestedUrls[0], /keyword=nova/);
-    assert.match(requestedUrls[0], /city=Dallas/);
-    assert.equal(failureHooks.setterCalls[10].at(-1), "Concert service unavailable");
-    assert.deepEqual(failureHooks.setterCalls[7].at(-1), []);
-  } finally {
-    failureHooks.restore();
-  }
+  let fetches = 0;
 
   global.fetch = async () => {
-    throw new DOMException("aborted", "AbortError");
+    fetches += 1;
+    return jsonResponse({ concerts: [] });
   };
-  const abortHooks = installHookHarness(
-    homeState({ search: "nova", location: "Dallas", hasSearched: true }),
-  );
+
+  const hooks = installHookHarness([false, null]);
+
   try {
-    const page = require("../../.ui-test-build/app/page.js");
-    page.default();
-    await flushPromises();
-    assert.equal(abortHooks.setterCalls[10].length, 1);
-    assert.equal(abortHooks.setterCalls[10][0], null);
-    assert.equal(abortHooks.setterCalls[9].at(-1), false);
+    const LunaSearch = require("../../.ui-test-build/components/LunaSearch.js").default;
+    const tree = LunaSearch({
+      value: "   ",
+      onChange: () => undefined,
+      onSearchStart: () => assert.fail("no search should start"),
+      onSearchSuccess: () => assert.fail("no search should run"),
+      onSearchError: () => assert.fail("the error belongs under the field"),
+    });
+
+    const form = findElements(tree, (element) => element.type === "form")[0];
+    await form.props.onSubmit({ preventDefault: () => undefined });
+
+    assert.equal(fetches, 0);
+    // Hook index 1 is the field's own error state.
+    assert.match(hooks.setterCalls[1].at(-1), /Search for a show/);
   } finally {
-    abortHooks.restore();
+    hooks.restore();
+    global.fetch = originalFetch;
+  }
+});
+
+test("the search field reports a failed concert request to the page", async () => {
+  const originalFetch = global.fetch;
+  const errors = [];
+
+  global.fetch = async () =>
+    jsonResponse({ error: "Ticketmaster is unavailable" }, false);
+
+  const hooks = installHookHarness([false, null]);
+
+  try {
+    const LunaSearch = require("../../.ui-test-build/components/LunaSearch.js").default;
+    const tree = LunaSearch({
+      value: "TX",
+      onChange: () => undefined,
+      onSearchStart: () => undefined,
+      onSearchSuccess: () => assert.fail("the request failed"),
+      onSearchError: (message) => errors.push(message),
+    });
+
+    const form = findElements(tree, (element) => element.type === "form")[0];
+    await form.props.onSubmit({ preventDefault: () => undefined });
+
+    // Past onSearchStart, so it belongs in the results area, not the field.
+    assert.deepEqual(errors, ["Ticketmaster is unavailable"]);
+    assert.equal(hooks.setterCalls[1].at(-1), null);
+  } finally {
+    hooks.restore();
     global.fetch = originalFetch;
   }
 });

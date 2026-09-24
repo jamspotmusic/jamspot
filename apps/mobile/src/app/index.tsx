@@ -1,5 +1,5 @@
-import { MapPin, Music2, Search } from 'lucide-react-native';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { Music2 } from 'lucide-react-native';
+import { useCallback, useMemo, useState } from 'react';
 import {
   FlatList,
   Pressable,
@@ -11,12 +11,13 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { openBrowserAsync } from 'expo-web-browser';
 
+import { AuthButton } from '@/components/auth-button';
 import { BrandHeader } from '@/components/brand-header';
 import { ConcertCard } from '@/components/concert-card';
 import { ConcertCardSkeleton } from '@/components/concert-card-skeleton';
 import { ConcertDetailsModal } from '@/components/concert-details-modal';
 import { Hero } from '@/components/hero';
-import { SearchField } from '@/components/search-field';
+import { LunaSearch } from '@/components/luna-search';
 import { SiteFooter } from '@/components/site-footer';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
@@ -29,11 +30,11 @@ import {
 } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { ApiError } from '@/lib/api';
+import type { NormalizedConcert } from '@jamspot/shared';
 import {
-  buildConcertSearchParams,
+  fetchConcertSearch,
   filterCardEvents,
   isCompleteCardEvent,
-  searchConcerts,
   toCardEvent,
   type CardEvent,
 } from '@/lib/concerts';
@@ -47,10 +48,9 @@ function describeError(err: unknown) {
  * submitted, then genre chips, a result count, and the paged card list.
  */
 export default function HomeScreen() {
-  const [keywordInput, setKeywordInput] = useState('');
-  const [locationInput, setLocationInput] = useState('');
-  const [keyword, setKeyword] = useState('');
-  const [location, setLocation] = useState('');
+  const [query, setQuery] = useState('');
+  /** The /api/concerts query string behind what's on screen, for refresh. */
+  const [lastSearch, setLastSearch] = useState<string | null>(null);
   const [hasSearched, setHasSearched] = useState(false);
   const [activeGenre, setActiveGenre] = useState('All');
   const [visibleCount, setVisibleCount] = useState(InitialCardLimit);
@@ -61,35 +61,11 @@ export default function HomeScreen() {
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [selectedEvent, setSelectedEvent] = useState<CardEvent | null>(null);
-
+  
+  // One line describing the search that produced these results, shown above
+  // them: Luna's reading of the query, or the state a bare state code meant.
+  const [searchInterpretation, setSearchInterpretation] = useState<string | null>(null);
   const theme = useTheme();
-
-  // Fetches whenever a search is submitted. Only ever sets state inside
-  // .then()/.catch() (never synchronously in the effect body) to satisfy
-  // this project's react-hooks/set-state-in-effect rule.
-  useEffect(() => {
-    if (!hasSearched) return;
-    if (!keyword && !location) return;
-
-    let cancelled = false;
-    searchConcerts(buildConcertSearchParams(keyword, location))
-      .then((concerts) => {
-        if (!cancelled) {
-          setEvents(concerts.map(toCardEvent));
-          setIsLoading(false);
-        }
-      })
-      .catch((err) => {
-        if (!cancelled) {
-          setFetchError(describeError(err));
-          setEvents([]);
-          setIsLoading(false);
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [hasSearched, keyword, location]);
 
   // Genres available, derived from the fetched events so the chips only ever
   // show options that actually have results.
@@ -98,37 +74,21 @@ export default function HomeScreen() {
     [events],
   );
 
-  const handleSearch = useCallback(() => {
-    const query = keywordInput.trim();
-    const loc = locationInput.trim();
-
-    setKeyword(query);
-    setLocation(loc);
-    setHasSearched(true);
-    setVisibleCount(InitialCardLimit);
-    setIsLoading(true);
-    setFetchError(null);
-
-    // Web pre-selects a genre chip when the query names one of the genres
-    // it already knows about, so "jazz" lands on the Jazz filter.
-    const matchedGenre = genres.find(
-      (genre) => genre !== 'All' && query.toLowerCase().includes(genre.toLowerCase()),
-    );
-    setActiveGenre(matchedGenre ?? 'All');
-  }, [genres, keywordInput, locationInput]);
-
+  // Re-runs the search that is on screen rather than rebuilding one from the
+  // field, so a pull-to-refresh can't quietly change the results by picking
+  // up text the user has since typed but not submitted.
   const onRefresh = useCallback(async () => {
-    if (!keyword && !location) return;
+    if (!lastSearch) return;
     setRefreshing(true);
     try {
-      const concerts = await searchConcerts(buildConcertSearchParams(keyword, location));
+      const concerts = await fetchConcertSearch(lastSearch);
       setEvents(concerts.map(toCardEvent));
       setFetchError(null);
     } catch (err) {
       setFetchError(describeError(err));
     }
     setRefreshing(false);
-  }, [keyword, location]);
+  }, [lastSearch]);
 
   const handleTicketPress = useCallback((event: CardEvent) => {
     if (!event.ticketUrl) return;
@@ -147,10 +107,37 @@ export default function HomeScreen() {
     setVisibleCount((prev) => prev + CardsPerLoad);
     setIsLoadingMore(false);
   }, []);
+  // The search field runs the whole search itself, so the screen only reacts
+  // to the three points that change what is on it. Results render through the
+  // existing FlatList, skeletons, and empty/error states either way.
+  const handleSearchStart = useCallback((interpretation?: string) => {
+    setActiveGenre('All');
+    setVisibleCount(InitialCardLimit);
+    setEvents([]);
+    setFetchError(null);
+    setSearchInterpretation(interpretation ?? null);
+    setHasSearched(true);
+    setIsLoading(true);
+  }, []);
+
+  const handleSearchSuccess = useCallback(
+    (concerts: NormalizedConcert[], search: string) => {
+      setEvents(concerts.map(toCardEvent));
+      setLastSearch(search);
+      setIsLoading(false);
+    },
+    [],
+  );
+
+  const handleSearchError = useCallback((message: string) => {
+    setFetchError(message);
+    setEvents([]);
+    setIsLoading(false);
+  }, []);
 
   const filtered = useMemo(
-    () => filterCardEvents(events, keyword, location, activeGenre),
-    [events, keyword, location, activeGenre],
+    () => filterCardEvents(events, activeGenre),
+    [events, activeGenre],
   );
 
   // Web only renders cards it can fill in completely, so a half-populated
@@ -166,35 +153,19 @@ export default function HomeScreen() {
     <ThemedView style={styles.container}>
       <SafeAreaView edges={['top']} style={styles.safeArea}>
         <View style={styles.headerBar}>
-          <BrandHeader />
-          <View style={styles.searchRow}>
-            <SearchField
-              icon={Search}
-              value={keywordInput}
-              onChangeText={setKeywordInput}
-              onSubmitEditing={handleSearch}
-              placeholder="Artist, venue, event, or genre..."
-            />
-            <SearchField
-              icon={MapPin}
-              value={locationInput}
-              onChangeText={setLocationInput}
-              onSubmitEditing={handleSearch}
-              placeholder="City or state"
-            />
-            <Pressable
-              onPress={handleSearch}
-              accessibilityRole="button"
-              style={({ pressed }) => [
-                styles.searchButton,
-                { backgroundColor: theme.primary },
-                pressed && styles.pressed,
-              ]}>
-              <ThemedText style={[styles.searchButtonText, { color: theme.primaryForeground }]}>
-                Search
-              </ThemedText>
-            </Pressable>
-          </View>
+          <BrandHeader>
+            <AuthButton />
+          </BrandHeader>
+          {/* JamSpot's only search field (TEA-51). A bare state goes straight
+              to Ticketmaster; everything else goes through the concert-query
+              Edge Function first. */}
+          <LunaSearch
+            value={query}
+            onChangeValue={setQuery}
+            onSearchStart={handleSearchStart}
+            onSearchSuccess={handleSearchSuccess}
+            onSearchError={handleSearchError}
+          />
         </View>
 
         {!hasSearched ? (
@@ -257,6 +228,12 @@ export default function HomeScreen() {
                       {filtered.length} event{filtered.length !== 1 ? 's' : ''}
                     </ThemedText>
                   </View>
+
+                  {searchInterpretation && (
+                    <ThemedText type="small" themeColor="textSecondary">
+                      {searchInterpretation}
+                    </ThemedText>
+                  )}
                 </View>
               ) : null
             }
@@ -348,18 +325,6 @@ const styles = StyleSheet.create({
     paddingHorizontal: Spacing.three,
     paddingBottom: Spacing.three,
     gap: Spacing.two,
-  },
-  searchRow: {
-    gap: Spacing.two,
-  },
-  searchButton: {
-    borderRadius: Radius.control,
-    paddingVertical: Spacing.two + Spacing.half,
-    alignItems: 'center',
-  },
-  searchButtonText: {
-    fontSize: 14,
-    fontWeight: '600',
   },
   gutter: {
     paddingHorizontal: Spacing.three,
