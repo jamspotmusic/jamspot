@@ -3,9 +3,16 @@ import test from "node:test";
 
 import {
   buildConcertsQuery,
+  classifySearchQuery,
   describeConcertQueryError,
   interpretConcertQuery,
+  MAX_SEARCH_QUERY_LENGTH,
+  resolveConcertSearch,
+  resolveStateQuery,
+  stateSearchParams,
+  US_STATES,
   type ConcertQueryBody,
+  type ConcertQueryInvoker,
   type DeviceLocation,
 } from "@jamspot/shared";
 
@@ -284,4 +291,204 @@ test("interpretConcertQuery rejects a response missing ticketmasterParams", asyn
     ),
     /Concert query returned an invalid response/,
   );
+});
+// --- resolveStateQuery ----------------------------------------------------
+
+test("resolveStateQuery matches a state by code or by name", () => {
+  assert.deepEqual(resolveStateQuery("TX"), { code: "TX", name: "Texas" });
+  assert.deepEqual(resolveStateQuery("Texas"), { code: "TX", name: "Texas" });
+  assert.deepEqual(resolveStateQuery("new york"), { code: "NY", name: "New York" });
+});
+
+test("resolveStateQuery ignores case, spacing, and punctuation", () => {
+  assert.equal(resolveStateQuery("  tx  ")?.code, "TX");
+  assert.equal(resolveStateQuery("T.X.")?.code, "TX");
+  assert.equal(resolveStateQuery("NEW   MEXICO")?.code, "NM");
+});
+
+test("resolveStateQuery sends Washington DC to the capital, not the state", () => {
+  assert.equal(resolveStateQuery("Washington DC")?.code, "DC");
+  assert.equal(resolveStateQuery("washington d.c.")?.code, "DC");
+  assert.equal(resolveStateQuery("District of Columbia")?.code, "DC");
+  // Washington on its own is still the state.
+  assert.equal(resolveStateQuery("Washington")?.code, "WA");
+});
+
+test("resolveStateQuery only matches a query that is nothing but a state", () => {
+  // Each of these contains a state name but is not one.
+  assert.equal(resolveStateQuery("Texas Hippie Coalition"), null);
+  assert.equal(resolveStateQuery("shows in Texas next month"), null);
+  assert.equal(resolveStateQuery("jazz near me"), null);
+  assert.equal(resolveStateQuery(""), null);
+});
+
+test("every state resolves from its own code and name", () => {
+  for (const state of US_STATES) {
+    assert.equal(resolveStateQuery(state.code)?.code, state.code, state.code);
+    assert.equal(resolveStateQuery(state.name)?.code, state.code, state.name);
+  }
+
+  assert.equal(US_STATES.length, 51, "50 states plus DC");
+});
+
+// --- classifySearchQuery --------------------------------------------------
+
+test("classifySearchQuery routes a bare state past Luna", () => {
+  const intent = classifySearchQuery("  texas ");
+
+  assert.equal(intent.kind, "state");
+  assert.equal(intent.kind === "state" && intent.state.code, "TX");
+  assert.equal(intent.query, "texas");
+});
+
+test("classifySearchQuery sends natural language to Luna", () => {
+  for (const query of [
+    "chill jazz under $60 this weekend",
+    "Radiohead",
+    "shows in Austin",
+    "TX and CA",
+  ]) {
+    assert.equal(classifySearchQuery(query).kind, "luna", query);
+  }
+});
+
+test("classifySearchQuery refuses input that cannot be a search", () => {
+  const blank = classifySearchQuery("   ");
+  assert.equal(blank.kind, "rejected");
+  assert.match(blank.kind === "rejected" ? blank.message : "", /Search for a show/);
+
+  const punctuation = classifySearchQuery("?!?! ...");
+  assert.equal(punctuation.kind, "rejected");
+  assert.match(
+    punctuation.kind === "rejected" ? punctuation.message : "",
+    /isn't something JamSpot can search/,
+  );
+
+  const long = classifySearchQuery("a".repeat(MAX_SEARCH_QUERY_LENGTH + 1));
+  assert.equal(long.kind, "rejected");
+  assert.match(
+    long.kind === "rejected" ? long.message : "",
+    new RegExp(`${MAX_SEARCH_QUERY_LENGTH} characters`),
+  );
+
+  // Exactly at the limit is still a search.
+  assert.equal(
+    classifySearchQuery("a".repeat(MAX_SEARCH_QUERY_LENGTH)).kind,
+    "luna",
+  );
+});
+
+test("classifySearchQuery keeps a non-Latin query searchable", () => {
+  assert.equal(classifySearchQuery("坂本龍一").kind, "luna");
+});
+
+// --- stateSearchParams ----------------------------------------------------
+
+test("stateSearchParams pins the country so a state code is unambiguous", () => {
+  assert.deepEqual(stateSearchParams({ code: "WA", name: "Washington" }), {
+    stateCode: "WA",
+    countryCode: "US",
+    classificationName: "music",
+    sort: "date,asc",
+  });
+});
+
+// --- resolveConcertSearch -------------------------------------------------
+
+/** An invoker that fails the test if the Edge Function is ever called. */
+const neverInvoked: ConcertQueryInvoker = async () => {
+  throw new Error("the Edge Function should not have been called");
+};
+
+test("resolveConcertSearch answers a bare state straight from Ticketmaster", async () => {
+  const resolved = await resolveConcertSearch(
+    "Texas",
+    "America/Chicago",
+    neverInvoked,
+    noLocation,
+  );
+
+  const search = new URLSearchParams(resolved.search);
+  assert.equal(resolved.source, "state");
+  assert.equal(search.get("stateCode"), "TX");
+  assert.equal(search.get("countryCode"), "US");
+  assert.equal(search.get("classificationName"), "music");
+  assert.equal(resolved.interpretation, "Upcoming live music across Texas.");
+});
+
+test("resolveConcertSearch sends everything else through Luna", async () => {
+  const queries: string[] = [];
+
+  const resolved = await resolveConcertSearch(
+    "chill jazz under $60",
+    "America/Chicago",
+    async (body) => {
+      queries.push(body.query);
+      return {
+        data: {
+          ticketmasterParams: { classificationName: "Jazz", city: "Dallas" },
+          filters: { maxPrice: 60, currency: "USD" },
+          interpretation: "Jazz around Dallas under $60.",
+        },
+        error: null,
+      };
+    },
+    noLocation,
+  );
+
+  const search = new URLSearchParams(resolved.search);
+  assert.deepEqual(queries, ["chill jazz under $60"]);
+  assert.equal(resolved.source, "luna");
+  assert.equal(search.get("classificationName"), "Jazz");
+  assert.equal(search.get("maxPrice"), "60");
+  assert.equal(resolved.interpretation, "Jazz around Dallas under $60.");
+});
+
+test("resolveConcertSearch refuses an unsearchable query before any request", async () => {
+  await assert.rejects(
+    resolveConcertSearch("", "UTC", neverInvoked, noLocation),
+    /Search for a show/,
+  );
+});
+
+test("resolveConcertSearch surfaces an out-of-scope refusal as-is", async () => {
+  await assert.rejects(
+    resolveConcertSearch(
+      "who won the game last night",
+      "UTC",
+      async () => ({
+        data: null,
+        error: httpError({
+          error: "JamSpot searches live music. Try an artist, a genre, a city, or a state.",
+          code: "out_of_scope",
+        }),
+      }),
+      noLocation,
+    ),
+    /JamSpot searches live music/,
+  );
+});
+
+test("resolveConcertSearch still runs Luna's location retry", async () => {
+  const bodies: ConcertQueryBody[] = [];
+
+  const resolved = await resolveConcertSearch(
+    "something chill tonight",
+    "UTC",
+    async (body) => {
+      bodies.push(body);
+      if (bodies.length === 1) {
+        return {
+          data: null,
+          error: httpError({ error: "Share your location", code: "location_required" }),
+        };
+      }
+      return { data: { ticketmasterParams: { geoPoint: "9q9p1dhfd" } }, error: null };
+    },
+    someLocation,
+  );
+
+  assert.equal(bodies.length, 2);
+  assert.deepEqual(bodies[1].location, { latitude: 32.78, longitude: -96.8 });
+  assert.match(resolved.search, /geoPoint=9q9p1dhfd/);
 });
