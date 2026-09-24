@@ -1,17 +1,21 @@
 "use client";
 
-import { useState, type FormEvent } from "react";
-import { Sparkles } from "lucide-react";
+import { type FormEvent, useState } from "react";
+import { Search, Sparkles } from "lucide-react";
 import {
-  buildConcertsQuery,
-  interpretConcertQuery,
+  classifySearchQuery,
+  resolveConcertSearch,
   type ConcertQueryBody,
-  type ConcertQueryResponse,
   type DeviceLocation,
   type NormalizedConcert,
+  type ResolvedConcertSearch,
 } from "@jamspot/shared";
 
 import { supabase } from "@/lib/supabase";
+
+/** The one search field the app has. Used by tests to find it. */
+export const SEARCH_PLACEHOLDER =
+  "Ask Luna: chill jazz under $60 this weekend — or a state like TX";
 
 /**
  * Ask the browser for coordinates. Resolves null when geolocation is
@@ -45,65 +49,80 @@ async function invokeConcertQuery(body: ConcertQueryBody) {
   return supabase.functions.invoke("concert-query", { body });
 }
 
+/**
+ * JamSpot's only search field (TEA-51).
+ *
+ * One line of text covers everything the old keyword and location inputs did.
+ * `resolveConcertSearch` decides what it is: a bare state goes straight to
+ * Ticketmaster, anything else goes through Luna, and input that isn't a
+ * search at all is refused in the field without a request being sent.
+ *
+ * Whichever path runs, the result is a query string for /api/concerts - the
+ * same route, the same result shape, and the same card grid as before.
+ *
+ * The query lives in the parent because this field moves: it sits in the
+ * middle of the hero until the first search and in the header afterwards, and
+ * the user's text should survive that.
+ */
 export default function LunaSearch({
+  value,
+  onChange,
+  variant = "hero",
   onSearchStart,
   onSearchSuccess,
   onSearchError,
 }: {
-  /** Fired before the concert request begins, so the page can reset its own
+  value: string;
+  onChange: (value: string) => void;
+  /** Sizing only: centred under the hero headline, or inline in the header. */
+  variant?: "hero" | "header";
+  /** Fired once a search is definitely running, so the page can reset its own
    *  filters and show its loading state. */
   onSearchStart: (interpretation?: string) => void;
   onSearchSuccess: (concerts: NormalizedConcert[]) => void;
   onSearchError: (message: string) => void;
 }) {
-  const [query, setQuery] = useState("");
-  const [isInterpreting, setIsInterpreting] = useState(false);
-  const [interpretError, setInterpretError] = useState<string | null>(null);
+  const [isSearching, setIsSearching] = useState(false);
+  const [inputError, setInputError] = useState<string | null>(null);
+
+  // A bare state skips the Edge Function, so the button shouldn't offer to
+  // ask Luna when nothing will be asked of her.
+  const isStateSearch = classifySearchQuery(value).kind === "state";
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
-    const trimmed = query.trim();
+    setIsSearching(true);
+    setInputError(null);
 
-    if (!trimmed) {
-      setInterpretError("Describe the kind of show you're looking for.");
-      return;
-    }
-
-    setIsInterpreting(true);
-    setInterpretError(null);
-
-    let result: ConcertQueryResponse;
+    let resolved: ResolvedConcertSearch;
 
     try {
       const timeZone =
         Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 
-      result = await interpretConcertQuery(
-        invokeConcertQuery,
-        trimmed,
+      resolved = await resolveConcertSearch(
+        value,
         timeZone,
+        invokeConcertQuery,
         requestBrowserLocation,
       );
     } catch (error) {
-      setIsInterpreting(false);
-      setInterpretError(
-        error instanceof Error ? error.message : "Concert query failed.",
+      // Nothing has been searched yet - a refused query, an out-of-scope one,
+      // or a Luna failure. It belongs under the field rather than in place of
+      // results the user may still be looking at.
+      setIsSearching(false);
+      setInputError(
+        error instanceof Error ? error.message : "Concert search failed.",
       );
       return;
     }
 
-    setIsInterpreting(false);
-    // Hand off to the existing concert search flow: same /api/concerts route,
-    // same result shape, same card grid the structured search renders into.
-    onSearchStart(result.interpretation);
+    setIsSearching(false);
+    onSearchStart(resolved.interpretation);
 
     try {
-      const search = buildConcertsQuery(
-        result.ticketmasterParams,
-        result.filters,
-      );
-      const response = await fetch(`/api/concerts?${search}`);
+      const response = await fetch(`/api/concerts?${resolved.search}`);
       const data = await response.json();
 
       if (!response.ok) {
@@ -122,37 +141,74 @@ export default function LunaSearch({
     }
   }
 
+  const isHero = variant === "hero";
+
   return (
-    <div className="mx-auto w-full max-w-xl">
+    <div
+      className={
+        isHero
+          ? "relative mx-auto w-full max-w-xl"
+          : "relative ml-auto w-full max-w-2xl"
+      }
+    >
       <form
         onSubmit={handleSubmit}
         autoComplete="off"
-        className="flex w-full flex-col gap-2 sm:flex-row sm:items-center"
+        role="search"
+        className={
+          isHero
+            ? "flex w-full flex-col gap-2 sm:flex-row sm:items-center"
+            : "flex w-full items-center gap-2"
+        }
       >
-        <div className="flex flex-1 items-center gap-2 rounded-lg border border-white/20 bg-black/40 px-4 py-3 backdrop-blur-sm transition-colors focus-within:border-primary/60">
-          <Sparkles size={16} className="shrink-0 text-primary" />
+        <div
+          className={
+            isHero
+              ? "flex flex-1 items-center gap-2 rounded-lg border border-white/20 bg-black/40 px-4 py-3 backdrop-blur-sm transition-colors focus-within:border-primary/60"
+              : "flex flex-1 items-center gap-2 rounded-lg border border-border bg-muted px-3 py-2 transition-colors focus-within:border-primary/50"
+          }
+        >
+          {isStateSearch ? (
+            <Search size={16} className="shrink-0 text-muted-foreground" />
+          ) : (
+            <Sparkles size={16} className="shrink-0 text-primary" />
+          )}
           <input
             type="text"
             name="luna"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Ask Luna: chill jazz shows under $60 this weekend..."
-            className="w-full flex-1 bg-transparent text-sm text-white outline-none placeholder:text-white/50"
+            aria-label="Search concerts"
+            value={value}
+            onChange={(e) => onChange(e.target.value)}
+            placeholder={SEARCH_PLACEHOLDER}
+            className={
+              isHero
+                ? "w-full flex-1 bg-transparent text-sm text-white outline-none placeholder:text-white/50"
+                : "w-full flex-1 truncate bg-transparent text-sm text-foreground outline-none placeholder:text-muted-foreground"
+            }
           />
         </div>
 
         <button
           type="submit"
-          disabled={isInterpreting}
-          className="shrink-0 cursor-pointer rounded-lg bg-primary px-5 py-3 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+          disabled={isSearching}
+          className={`shrink-0 cursor-pointer rounded-lg bg-primary text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50 ${
+            isHero ? "px-5 py-3" : "px-4 py-2"
+          }`}
         >
-          {isInterpreting ? "Asking Luna..." : "Ask Luna"}
+          {isSearching ? "Searching..." : isStateSearch ? "Search" : "Ask Luna"}
         </button>
       </form>
 
-      {interpretError && (
-        <p role="alert" className="mt-2 text-sm text-red-300">
-          {interpretError}
+      {inputError && (
+        <p
+          role="alert"
+          className={
+            isHero
+              ? "mt-2 text-sm text-red-300"
+              : "absolute left-0 right-0 top-full z-10 mt-1 text-sm text-red-400"
+          }
+        >
+          {inputError}
         </p>
       )}
     </div>

@@ -14,7 +14,20 @@ export type NormalizedConcert = {
   id: string;
   name: string;
   artist: string | null;
+  /**
+   * Ticketmaster attraction id for `artist`, when the event has one.
+   *
+   * Names are not identities: two acts can share one, and one act can be
+   * spelled several ways across events. The discovery pages (TEA-67) key
+   * artists off this instead, so /artists/<slug> always means one attraction.
+   */
+  artistId: string | null;
   venue: string | null;
+  /**
+   * Ticketmaster venue id for `venue`. Same reasoning as `artistId`, and
+   * more load-bearing: "House of Blues" names a dozen different rooms.
+   */
+  venueId: string | null;
   city: string | null;
   state: string | null;
   date: string | null;
@@ -660,4 +673,286 @@ export function buildConcertsQuery(
   }
 
   return search.toString();
+}
+
+// ---------------------------------------------------------------------------
+// One search field (TEA-51)
+// ---------------------------------------------------------------------------
+//
+// Luna's field is the only search input either app has, so everything the two
+// old fields used to express - a keyword, and a city or state - now arrives as
+// one line of text. That makes this module responsible for deciding what a
+// given line of text *is* before anything is spent on it:
+//
+//   1. A bare state ("TX", "Texas") is answered without Luna. There is no
+//      natural language to interpret in it, so an OpenAI round trip would add
+//      latency and cost to produce the `stateCode` we can already see.
+//   2. Anything else goes to Luna, which decides whether it is a live-music
+//      request at all (see SCOPE RULES in the Edge Function's instructions)
+//      and turns it into Ticketmaster parameters.
+//   3. Input that is not a search in either sense - blank, over-long, or
+//      punctuation with no word in it - is refused here, before any network
+//      call, with a message the caller shows the user.
+//
+// Both apps call resolveConcertSearch and get back a query string for
+// /api/concerts, so the two clients cannot drift on which queries bypass Luna
+// or on how a refusal is worded.
+
+/** A US state (or DC) Ticketmaster will accept as a `stateCode`. */
+export type UsState = {
+  /** Two-letter code, uppercase - Ticketmaster's `stateCode`. */
+  code: string;
+  name: string;
+};
+
+/**
+ * The 50 states plus the District of Columbia, which Ticketmaster treats as a
+ * state code of its own. Territories are deliberately absent: Ticketmaster's
+ * US coverage of them is thin enough that "PR" is far more likely to be a
+ * typo or an artist's initials than a search for Puerto Rico.
+ */
+export const US_STATES: readonly UsState[] = [
+  { code: "AL", name: "Alabama" },
+  { code: "AK", name: "Alaska" },
+  { code: "AZ", name: "Arizona" },
+  { code: "AR", name: "Arkansas" },
+  { code: "CA", name: "California" },
+  { code: "CO", name: "Colorado" },
+  { code: "CT", name: "Connecticut" },
+  { code: "DE", name: "Delaware" },
+  { code: "DC", name: "District of Columbia" },
+  { code: "FL", name: "Florida" },
+  { code: "GA", name: "Georgia" },
+  { code: "HI", name: "Hawaii" },
+  { code: "ID", name: "Idaho" },
+  { code: "IL", name: "Illinois" },
+  { code: "IN", name: "Indiana" },
+  { code: "IA", name: "Iowa" },
+  { code: "KS", name: "Kansas" },
+  { code: "KY", name: "Kentucky" },
+  { code: "LA", name: "Louisiana" },
+  { code: "ME", name: "Maine" },
+  { code: "MD", name: "Maryland" },
+  { code: "MA", name: "Massachusetts" },
+  { code: "MI", name: "Michigan" },
+  { code: "MN", name: "Minnesota" },
+  { code: "MS", name: "Mississippi" },
+  { code: "MO", name: "Missouri" },
+  { code: "MT", name: "Montana" },
+  { code: "NE", name: "Nebraska" },
+  { code: "NV", name: "Nevada" },
+  { code: "NH", name: "New Hampshire" },
+  { code: "NJ", name: "New Jersey" },
+  { code: "NM", name: "New Mexico" },
+  { code: "NY", name: "New York" },
+  { code: "NC", name: "North Carolina" },
+  { code: "ND", name: "North Dakota" },
+  { code: "OH", name: "Ohio" },
+  { code: "OK", name: "Oklahoma" },
+  { code: "OR", name: "Oregon" },
+  { code: "PA", name: "Pennsylvania" },
+  { code: "RI", name: "Rhode Island" },
+  { code: "SC", name: "South Carolina" },
+  { code: "SD", name: "South Dakota" },
+  { code: "TN", name: "Tennessee" },
+  { code: "TX", name: "Texas" },
+  { code: "UT", name: "Utah" },
+  { code: "VT", name: "Vermont" },
+  { code: "VA", name: "Virginia" },
+  { code: "WA", name: "Washington" },
+  { code: "WV", name: "West Virginia" },
+  { code: "WI", name: "Wisconsin" },
+  { code: "WY", name: "Wyoming" },
+];
+
+/**
+ * Spellings that are unambiguously one state but are neither its code nor its
+ * full name. "Washington DC" is the important one: without it, the capital
+ * would resolve to Washington state, 2,700 miles away.
+ */
+const STATE_ALIASES: Readonly<Record<string, string>> = {
+  "washington dc": "DC",
+  "district of columbia": "DC",
+  "washington district of columbia": "DC",
+};
+
+/**
+ * Lowercased, punctuation-free, single-spaced - so "  new  york. " and
+ * "New York" are the same lookup key, and "D.C." matches "dc".
+ */
+function stateLookupKey(value: string): string {
+  return value
+    .replace(/[.,]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+/**
+ * The state the whole query names, or null.
+ *
+ * Deliberately an exact match against the entire input rather than a search
+ * within it: "Texas" is a request for shows in Texas, but "Texas Hippie
+ * Coalition" is a band and "shows in Texas next month" carries a date Luna
+ * needs to read. Only a query that is nothing but a state can skip Luna.
+ *
+ * Two-letter codes are matched the same way, which means a query of exactly
+ * "OR", "IN", or "OK" is read as Oregon, Indiana, and Oklahoma rather than as
+ * an English word. On a field whose entire content is those two letters,
+ * that is the reading that produces results.
+ */
+export function resolveStateQuery(raw: string): UsState | null {
+  const key = stateLookupKey(raw);
+
+  if (!key) return null;
+
+  const aliased = STATE_ALIASES[key];
+
+  if (aliased) {
+    return US_STATES.find((state) => state.code === aliased) ?? null;
+  }
+
+  return (
+    US_STATES.find(
+      (state) =>
+        key === state.code.toLowerCase() || key === state.name.toLowerCase(),
+    ) ?? null
+  );
+}
+
+/**
+ * Longest query the Edge Function accepts. Enforced here too so an over-long
+ * query is refused in the field rather than after a round trip.
+ */
+export const MAX_SEARCH_QUERY_LENGTH = 500;
+
+const EMPTY_QUERY_MESSAGE =
+  "Search for a show — an artist, a genre, a city, or a state.";
+const LONG_QUERY_MESSAGE =
+  `Keep your search to ${MAX_SEARCH_QUERY_LENGTH} characters or fewer.`;
+const UNSEARCHABLE_QUERY_MESSAGE =
+  "That isn't something JamSpot can search. Try an artist, a genre, a city, or a state.";
+
+/** What a line of text in the search field turns out to be. */
+export type SearchIntent =
+  /** A bare state: answered straight from Ticketmaster, no Luna involved. */
+  | { kind: "state"; query: string; state: UsState }
+  /** Natural language: Luna interprets it and decides whether it's in scope. */
+  | { kind: "luna"; query: string }
+  /** Not a search at all. `message` is written for the user. */
+  | { kind: "rejected"; query: string; message: string };
+
+/**
+ * First of the two scope gates a query passes before anything reaches
+ * Ticketmaster. This one is structural and runs in the client: it refuses
+ * input that cannot be a search whatever it means - nothing typed, more text
+ * than the function accepts, or punctuation with no word in it.
+ *
+ * The second gate is Luna itself, which judges whether the words describe a
+ * live-music search and refuses the ones that don't (`out_of_scope`). It has
+ * to be the model's call: no pattern here can tell "something loud tonight"
+ * from "what's the weather tonight".
+ *
+ * A query that resolves to a state skips the second gate, and correctly so -
+ * a state is a Ticketmaster search parameter, not a question.
+ */
+export function classifySearchQuery(raw: string): SearchIntent {
+  const query = raw.replace(/\s+/g, " ").trim();
+
+  if (!query) {
+    return { kind: "rejected", query, message: EMPTY_QUERY_MESSAGE };
+  }
+
+  if (query.length > MAX_SEARCH_QUERY_LENGTH) {
+    return { kind: "rejected", query, message: LONG_QUERY_MESSAGE };
+  }
+
+  // Strip ASCII punctuation and whitespace; anything left is a word, in any
+  // script. Written as explicit ranges rather than a \p{...} class so it runs
+  // identically on Hermes, which has no Unicode property escapes.
+  if (!query.replace(/[\s!-/:-@[-`{-~]+/g, "")) {
+    return { kind: "rejected", query, message: UNSEARCHABLE_QUERY_MESSAGE };
+  }
+
+  const state = resolveStateQuery(query);
+
+  if (state) {
+    return { kind: "state", query, state };
+  }
+
+  return { kind: "luna", query };
+}
+
+/**
+ * The Ticketmaster search a bare state name means: every music event in that
+ * state, soonest first.
+ *
+ * `countryCode` is pinned because state codes are not globally unique -
+ * without it, "WA" is Washington and Western Australia both.
+ */
+export function stateSearchParams(state: UsState): TicketmasterParams {
+  return {
+    stateCode: state.code,
+    countryCode: "US",
+    classificationName: "music",
+    sort: "date,asc",
+  };
+}
+
+/** The line shown above the results for a state search, in place of Luna's. */
+export function describeStateSearch(state: UsState): string {
+  return `Upcoming live music across ${state.name}.`;
+}
+
+export type ResolvedConcertSearch = {
+  /** Query string for /api/concerts, ready to fetch. */
+  search: string;
+  /** One sentence describing the search, shown above the results. */
+  interpretation?: string;
+  /** Which path produced it - a bare state, or Luna. */
+  source: "state" | "luna";
+};
+
+/**
+ * Turn whatever is in the search field into a /api/concerts query string.
+ *
+ * Everything up to (but not including) the concert request lives here, so the
+ * two apps share the bypass rule, the scope refusals, and Luna's
+ * location-retry handshake, and differ only in how they fetch.
+ *
+ * Throws an Error whose message is written for the user: a refused query, an
+ * out-of-scope one, or a Luna failure. Callers surface it directly.
+ */
+export async function resolveConcertSearch(
+  raw: string,
+  timeZone: string,
+  invoke: ConcertQueryInvoker,
+  requestDeviceLocation: DeviceLocationProvider,
+): Promise<ResolvedConcertSearch> {
+  const intent = classifySearchQuery(raw);
+
+  if (intent.kind === "rejected") {
+    throw new Error(intent.message);
+  }
+
+  if (intent.kind === "state") {
+    return {
+      search: buildConcertsQuery(stateSearchParams(intent.state)),
+      interpretation: describeStateSearch(intent.state),
+      source: "state",
+    };
+  }
+
+  const result = await interpretConcertQuery(
+    invoke,
+    intent.query,
+    timeZone,
+    requestDeviceLocation,
+  );
+
+  return {
+    search: buildConcertsQuery(result.ticketmasterParams, result.filters),
+    interpretation: result.interpretation,
+    source: "luna",
+  };
 }
