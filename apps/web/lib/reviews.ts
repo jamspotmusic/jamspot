@@ -1,7 +1,9 @@
-import { supabase } from "@/lib/supabase";
-import type { Review, NewReview, ReviewUpdate } from "@jamspot/shared";
+import type { SupabaseClient } from "@supabase/supabase-js";
 
-export type { Review, NewReview, ReviewUpdate };
+import { supabase } from "@/lib/supabase";
+import type { Review, NewReview, ReviewUpdate, ReviewAuthor } from "@jamspot/shared";
+
+export type { Review, NewReview, ReviewUpdate, ReviewAuthor };
 
 export class ReviewsError extends Error {
   constructor(message: string) {
@@ -11,19 +13,30 @@ export class ReviewsError extends Error {
 }
 
 /**
+ * `select("*")` already returns the embedded `profiles` author object - it is
+ * not a separate embed that has to be asked for. Spelling it out as
+ * `"*, profiles(id, username)"` actually emits a duplicate `profiles` key in
+ * the response, so leave this alone.
+ */
+const SELECT_ALL = "*";
+
+/**
  * Fetch all reviews, most recent first.
+ *
+ * Reads are public: this uses the anonymous client, which is what Row Level
+ * Security allows an unauthenticated visitor to do.
  */
 export async function getReviews(): Promise<Review[]> {
   const { data, error } = await supabase
     .from("reviews")
-    .select("*")
+    .select(SELECT_ALL)
     .order("created_at", { ascending: false });
 
   if (error) {
     throw new ReviewsError(`Failed to fetch reviews: ${error.message}`);
   }
 
-  return data ?? [];
+  return (data ?? []) as Review[];
 }
 
 /**
@@ -33,7 +46,7 @@ export async function getReviews(): Promise<Review[]> {
 export async function getReviewById(id: string): Promise<Review | null> {
   const { data, error } = await supabase
     .from("reviews")
-    .select("*")
+    .select(SELECT_ALL)
     .eq("id", id)
     .maybeSingle();
 
@@ -41,32 +54,42 @@ export async function getReviewById(id: string): Promise<Review | null> {
     throw new ReviewsError(`Failed to fetch review ${id}: ${error.message}`);
   }
 
-  return data;
+  return (data ?? null) as Review | null;
 }
 
 /**
  * Insert a new review. Returns the created row, including the
- * database-generated `id` and `created_at`.
+ * database-generated `id`, `created_at`, and `updated_at`.
+ *
+ * Unlike the read helpers, this takes the Supabase client to use rather than
+ * reaching for the module-level anonymous one. Writes are governed by Row
+ * Level Security, which requires `author_id` to match the signed-in user, so
+ * the caller must pass a client carrying that user's session (see
+ * lib/supabase-server.ts) together with their id. `authorId` is a separate
+ * argument for the same reason it is absent from `NewReview`: it must come
+ * from the verified session, never from request input.
  */
-export async function createReview(input: NewReview): Promise<Review> {
-  const { data, error } = await supabase
+export async function createReview(
+  client: SupabaseClient,
+  authorId: string,
+  input: NewReview,
+): Promise<Review> {
+  const { data, error } = await client
     .from("reviews")
     .insert({
-      musician: input.musician,
-      venue: input.venue,
-      concert_date: input.concertDate,
-      review_text: input.reviewText,
-      venue_city: input.venueCity ?? null,
-      venue_state: input.venueState ?? null,
-      venue_country: input.venueCountry ?? null,
-      user_name: input.userName ?? null,
+      short_description: input.shortDescription,
+      description: input.description,
+      star_rating: input.starRating,
+      location: input.location,
+      review_date: input.reviewDate,
+      author_id: authorId,
     })
-    .select()
+    .select(SELECT_ALL)
     .single();
 
   if (error) {
     throw new ReviewsError(`Failed to create review: ${error.message}`);
   }
 
-  return data;
+  return data as Review;
 }
