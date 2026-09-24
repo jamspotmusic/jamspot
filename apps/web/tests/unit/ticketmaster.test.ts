@@ -132,8 +132,15 @@ test("searchConcerts normalizes a full event", async () => {
             priceRanges: [{ min: 40, max: 120, currency: "USD" }],
             dates: { start: { localDate: "2026-09-15", localTime: "19:30:00" } },
             _embedded: {
-              venues: [{ name: "The Granada", city: { name: "Dallas" }, state: { stateCode: "TX" } }],
-              attractions: [{ name: "Nova Bloom" }],
+              venues: [
+                {
+                  id: "venue-granada",
+                  name: "The Granada",
+                  city: { name: "Dallas" },
+                  state: { stateCode: "TX" },
+                },
+              ],
+              attractions: [{ id: "attr-nova", name: "Nova Bloom" }],
             },
           } satisfies Record<string, unknown>,
         ],
@@ -154,7 +161,9 @@ test("searchConcerts normalizes a full event", async () => {
     id: "evt-1",
     name: "Nova Bloom Live",
     artist: "Nova Bloom",
+    artistId: "attr-nova",
     venue: "The Granada",
+    venueId: "venue-granada",
     city: "Dallas",
     state: "TX",
     date: "2026-09-15",
@@ -193,7 +202,9 @@ test("searchConcerts falls back for sparse events", async () => {
   }
 
   assert.equal(result[0].artist, null);
+  assert.equal(result[0].artistId, null);
   assert.equal(result[0].venue, null);
+  assert.equal(result[0].venueId, null);
   assert.equal(result[0].city, null);
   assert.equal(result[0].state, null);
   assert.equal(result[0].date, null);

@@ -14,7 +14,20 @@ export type NormalizedConcert = {
   id: string;
   name: string;
   artist: string | null;
+  /**
+   * Ticketmaster attraction id for `artist`, when the event has one.
+   *
+   * Names are not identities: two acts can share one, and one act can be
+   * spelled several ways across events. The discovery pages (TEA-67) key
+   * artists off this instead, so /artists/<slug> always means one attraction.
+   */
+  artistId: string | null;
   venue: string | null;
+  /**
+   * Ticketmaster venue id for `venue`. Same reasoning as `artistId`, and
+   * more load-bearing: "House of Blues" names a dozen different rooms.
+   */
+  venueId: string | null;
   city: string | null;
   state: string | null;
   date: string | null;
