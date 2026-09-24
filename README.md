@@ -256,6 +256,20 @@ LASTFM_API_KEY=
 
 These variables are not required until the corresponding integrations are implemented.
 
+One more is optional but matters in deployed environments:
+
+```env
+NEXT_PUBLIC_SITE_URL=https://jamspot-three.vercel.app
+```
+
+It is the public origin the discovery pages build canonical URLs, Open Graph
+tags, the sitemap, and JSON-LD from. It must be the **public** domain — a
+canonical pointing at a preview deployment tells crawlers the preview is the
+real page. It defaults to the production deployment when unset, so local
+development needs nothing.
+
+`apps/web/.env.example` is the authoritative list.
+
 ### 5. Confirm `.env.local` Is Ignored
 
 Run:
@@ -385,6 +399,339 @@ PostgreSQL
 ```
 
 The temporary connection-test route and database table should be removed after the real preferences database flow is implemented and verified.
+
+---
+
+## Authentication (passwordless email OTP)
+
+Both apps sign in against the **same Supabase project**, so they share one Auth
+user population: an account created by emailing a code on the phone signs in on
+the web with the same address, and vice versa.
+
+Authentication is **optional**. Concert search and reviews are fully usable
+signed out — there are no route guards, no redirects, and no middleware. Signing
+in only adds a header affordance ("Sign in" on web, a Sign in button on mobile).
+
+### How the flow works
+
+There are no passwords anywhere in the system. `signInWithPassword`, password
+signup, and password reset are deliberately not implemented.
+
+1. The user enters an email address.
+2. The app calls `supabase.auth.signInWithOtp({ email })`.
+3. The UI moves to a code-entry step.
+4. The user types the 8-digit code from the email.
+5. The app calls `supabase.auth.verifyOtp({ email, token, type: "email" })`.
+6. A successful verification creates a Supabase session.
+7. The session persists — across reload on web, across app restart on mobile.
+8. Signing out clears the local session and returns the UI to signed out.
+
+The same address is signed up on first use and signed in thereafter, so there is
+no separate registration screen.
+
+### Where the code lives
+
+| Concern | Location |
+| --- | --- |
+| Flow, validation, error wording | `packages/shared/src/index.ts` |
+| Web browser client (cookies) | `apps/web/lib/supabase-browser.ts` |
+| Web server client (Server Components) | `apps/web/lib/supabase-server.ts` |
+| Web auth state | `apps/web/components/AuthProvider.tsx` |
+| Web UI | `apps/web/components/SignInForm.tsx`, `SignInPanel.tsx`, `AuthNav.tsx`, `app/sign-in/page.tsx` |
+| Mobile client (AsyncStorage) | `apps/mobile/src/lib/supabase.ts` |
+| Mobile auth state | `apps/mobile/src/hooks/use-auth.tsx` |
+| Mobile UI | `apps/mobile/src/components/auth-modal.tsx`, `auth-button.tsx` |
+
+The two apps deliberately have **separate client implementations** because their
+session handling differs: web writes the session to cookies via `@supabase/ssr`
+so Server Components can read it, while React Native has no cookie jar and
+persists to AsyncStorage instead. What *is* shared is the framework-agnostic
+part — the OTP flow, input validation, and user-facing error messages — which
+lives in `@jamspot/shared` and takes the client's `auth` object as a parameter
+rather than importing one. No instantiated Supabase client is shared.
+
+### Environment variables
+
+Web (`apps/web/.env.local`, template at `apps/web/.env.example`):
+
+```env
+NEXT_PUBLIC_SUPABASE_URL=
+NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=
+```
+
+Mobile (`apps/mobile/.env`, template at `apps/mobile/.env.example`):
+
+```env
+EXPO_PUBLIC_SUPABASE_URL=
+EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY=
+```
+
+Point both at the same project. Values come from the Supabase dashboard under
+**Project Settings → Data API**.
+
+Only the project URL and the publishable (anon) key belong in either app.
+`NEXT_PUBLIC_*` is inlined into the browser bundle and `EXPO_PUBLIC_*` is
+embedded in the app binary, so both are readable by anyone. A service-role key,
+database password, or JWT secret must never appear in either. Client-side checks
+are for UX only — **Row Level Security is what actually protects data**, and it
+governs these clients exactly as it governs an anonymous one.
+
+### Dependencies this added
+
+| Package | Workspace | Why |
+| --- | --- | --- |
+| `@supabase/ssr` | `apps/web` | Cookie-based sessions readable by Next.js Server Components. Replaces the deprecated `@supabase/auth-helpers-nextjs`, which is not used. |
+| `@supabase/supabase-js` | `apps/mobile` | The mobile app previously reached the API only over `fetch` and had no Supabase client. |
+| `@react-native-async-storage/async-storage` | `apps/mobile` | Session persistence across app restarts. No storage dependency existed in the repo; this is Supabase's recommended React Native option, installed via `npx expo install` for an SDK-compatible version. |
+
+### Running the auth tests
+
+```bash
+npm run test:web
+```
+
+The OTP flow is tested against a fake `auth` object, so no test sends a real
+email or touches the network. See `apps/web/tests/unit/auth.test.ts`.
+
+---
+
+## Search (one field)
+
+Both apps have exactly **one search input**. The keyword field and the separate
+city/state field are gone — a single line of natural language covers everything
+they did, and everything they could not.
+
+```text
+chill jazz under $60 this weekend
+Radiohead
+something loud tonight
+Texas
+```
+
+### What happens to a query
+
+`resolveConcertSearch` in `packages/shared/src/index.ts` decides which of three
+things a query is, before anything is spent on it:
+
+| Input | Path | Why |
+| --- | --- | --- |
+| A bare state — `TX`, `Texas`, `Washington DC` | **Straight to Ticketmaster** as `stateCode` | There is no natural language in it to interpret. Sending it to the model would add a round trip and a token spend to produce a parameter already sitting in the input. |
+| Anything else | **Luna** (`concert-query` Edge Function), then Ticketmaster | Needs a model to turn words into a keyword, genres, a date range, a price ceiling, and a place. |
+| Blank, over 500 characters, or punctuation with no word in it | **Refused in the field** | Cannot be a search whatever it means, so no request is sent. |
+
+The state match is against the **whole** query, not a substring: `Texas` is a
+search for shows in Texas, but `Texas Hippie Coalition` is a band and
+`shows in Texas next month` carries a date, so both go to Luna. A query of
+exactly `OR`, `IN`, or `OK` is read as Oregon, Indiana, and Oklahoma —
+on a field whose entire content is those two letters, that is the reading that
+returns results.
+
+Whichever path runs, the output is a query string for `/api/concerts` — the
+same route, the same response shape, and the same card grid for all three.
+
+### Validating what comes back
+
+The Edge Function does not trust the model's output. OpenAI's strict JSON
+schema constrains it upstream, but a schema change, a model swap, a truncated
+response, or a proxy in between all arrive as ordinary JSON that `JSON.parse`
+accepts. So `handler.ts` validates in two layers:
+
+1. **Shape** — a **Zod** schema (`modelOutputSchema`) checks every field is
+   present and of the right type. Unknown keys are stripped rather than
+   rejected, so a field the model adds does not fail an otherwise good search.
+2. **Values** — the normalizers coerce each value into something Ticketmaster
+   accepts (`"ca"` → `"CA"`, `24.6` miles → `25`) or throw. A state name where
+   a state code belongs is plausible output that would return zero events, so
+   it is rejected rather than passed on.
+
+A third Zod schema, `ticketmasterParamsSchema`, is the last gate before the
+parameters leave. It rejects values Ticketmaster would not honour, and makes
+two things true by construction rather than by the good behaviour of the code
+above it:
+
+* **`classificationName` is required and must be music** — `"music"` itself or
+  a subset of Ticketmaster's music genres. Ticketmaster's catalogue is much
+  wider than music, and this is what keeps a JamSpot search inside the part of
+  it the app is about. A request for a sports fixture or a play cannot leave
+  the function even if the model builds one.
+* **A bare `"music"` classification is not a search on its own.** Without a
+  genre, a keyword, or a place beside it, that asks Ticketmaster for every
+  event it has.
+
+Anything that fails is a `502` with `"Unable to interpret concert query"`. The
+detail goes to the log, never to the client.
+
+### Scope
+
+A request is checked to be a live-music search **before** any of it reaches
+Ticketmaster. There are two gates:
+
+* **In the client**, structurally: blank, over-long, or wordless input is
+  refused without a network call.
+* **In the model**, semantically: the output schema carries `inScope` and
+  `rejection`. Out of scope covers more than off-topic chatter — it includes
+  **the non-music events Ticketmaster does sell**. `Lakers game tickets`,
+  `Hamilton on Broadway`, and `comedy show tonight` are all refused, as are
+  questions, requests for advice, anything about an existing order, and text
+  written at the model rather than at the search. The function answers `422`
+  with `code: "out_of_scope"` — no location resolved, no parameters built,
+  nothing the model extracted echoed back. Both apps show that sentence under
+  the field, and the hero stays where it is rather than switching to an empty
+  results view.
+* **When the model cannot tell**, `inScope` is false. Refusing a search
+  somebody meant costs them one retry; running one they did not mean returns
+  concerts to a person who asked about something else.
+
+The second gate has to be the model's: no pattern can tell
+`something loud tonight` from `what's the weather tonight`.
+
+A refusal is not the only thing standing between a non-music request and
+Ticketmaster. `classificationName` is *always* music (see above), so even a
+request the model wrongly lets through is searched against music events only —
+the model deciding is what makes it a clear refusal rather than an empty grid.
+
+A bare state skips the second gate, correctly — a state is a search parameter,
+not a question.
+
+### Where the code lives
+
+| Concern | Location |
+| --- | --- |
+| State list, bypass rule, scope refusals, search resolution | `packages/shared/src/index.ts` |
+| Model prompt, Zod validation, scope gate, location resolution | `supabase/functions/concert-query/handler.ts` |
+| Web field | `apps/web/components/LunaSearch.tsx` |
+| Mobile field | `apps/mobile/src/components/luna-search.tsx` |
+| Ticketmaster request | `apps/web/app/api/concerts/route.ts`, `apps/web/lib/ticketmaster.ts` |
+
+On web the field sits in the middle of the hero until the first search and in
+the header afterwards, so it stays reachable above the results. Only one is
+mounted at a time and the query is held by the page, so the text survives the
+move.
+
+### Running the search tests
+
+```bash
+npm run test:web        # the shared resolver, the field, and the page
+npm run test:functions  # the Edge Function, including Zod and scope
+npm run test:e2e        # the whole flow in a browser, with both paths mocked
+```
+
+No test reaches OpenAI, Supabase, or Ticketmaster.
+
+---
+
+## Discovery pages (SEO)
+
+The search field is a fine way in **if you already have JamSpot open**. Someone
+arriving from a search engine does not, so JamSpot also publishes pages that
+answer a question by existing at a URL:
+
+```text
+/concerts/san-diego           Concerts in San Diego
+/concerts/san-diego/indie     Indie concerts in San Diego
+/artists/the-national         One act's upcoming dates
+/venues/belly-up-tavern       One room's schedule
+```
+
+Every one of them is server-rendered with the events already in the HTML, using
+the same `EventCard` grid and the same concert modal as a search. A crawler that
+executes no JavaScript sees the whole listing, and the ticket CTA still opens
+the same Ticketmaster URL it always did.
+
+### What decides that a URL exists
+
+Cities and genres come from curated registries in
+`apps/web/lib/discovery/taxonomy.ts` — 43 US markets, 17 genres. This is the
+load-bearing decision in the whole feature. Without a registry,
+`/concerts/<anything>` would be an open proxy onto the Ticketmaster Discovery
+API: unbounded requests against our rate limit, and an unbounded set of thin,
+near-identical pages for crawlers to find. An unresolvable slug is a **404**,
+and it costs no Ticketmaster request to say so.
+
+Artists and venues cannot work that way — there are hundreds of thousands of
+them and the set changes daily — so they are resolved against Ticketmaster on
+strict terms: the slug is searched as a keyword, a candidate counts only if its
+own name slugifies back to the requested slug, and identity from then on is the
+**Ticketmaster attraction/venue id**. That is what stops `/artists/the-national`
+from becoming a page about the Tom Petty tribute act a keyword search also
+returns, and what keeps "Belly Up Aspen" and "Belly Up Tavern" two rooms.
+
+### One URL per page
+
+`apps/web/proxy.ts` normalizes casing and formatting before the request reaches
+a route:
+
+```text
+/concerts/San-Diego     ─┐
+/concerts/SAN-DIEGO      ├─ 308 ─→  /concerts/san-diego
+/concerts/san--diego     │
+/concerts/san%20diego   ─┘
+```
+
+It has to happen in the proxy rather than in the page. These routes are
+incrementally regenerated, and a `redirect()` thrown during regeneration is
+cached as that path's own prerender — which produced a 307 that had lost its
+`Location` header. Normalizing first means only canonical paths are ever
+rendered or stored.
+
+Where Ticketmaster spells one entity two ways — it embeds a Milwaukee room in
+events as "The Rave/Eagles Club" while its venues endpoint calls the same room
+"Eagles Club/The Rave/Eagles Ballroom" — the alternate renders at 200 and points
+`<link rel="canonical">` at the entity's own URL, rather than redirecting.
+
+### What gets indexed
+
+A page earns indexing by answering the question its URL asks. It gets
+`noindex, follow` when it has no upcoming events, and when Ticketmaster could
+not be reached — an outage must not be published as a durable "nothing on here".
+`follow` stays on either way, so a quiet page is still a route through to the
+ones with shows.
+
+`Event` structured data carries only what Ticketmaster supplied. There is no
+`eventStatus`, no `eventAttendanceMode`, no `offers.availability` — a published
+price range says what tickets cost, not whether any are left — no street address
+for a venue we only have a city for, and no start time dressed up with a
+timezone Ticketmaster never gave.
+
+### The sitemap
+
+`/sitemap.xml` is derived from one pass of real data, not from arithmetic:
+
+```text
+1 request per registered city          →  43 requests
+city listed only if it returned events
+its genre pages read out of that same response  →  0 extra requests
+top artists/venues resolved through their own route helpers
+```
+
+That yields the ~460 city/genre combinations that actually have shows rather
+than all 731, and every artist and venue URL in the file has been confirmed to
+resolve. Roughly one slug in twenty guessed from an event's embedded name does
+*not* resolve against the attractions/venues search endpoints, and those are
+dropped rather than listed broken.
+
+### Analytics attribution
+
+`apps/web/lib/analytics/discovery-attribution.ts` carries a surface
+(`seo_city`, `seo_city_genre`, `seo_artist`, `seo_venue`) from the server-rendered
+route through the card and the detail modal onto the ticket click, so the
+journey from Google to Ticketmaster stays identifiable once TEA-54 lands.
+
+No analytics provider is wired up — TEA-54 owns that choice — so the default
+sink drops everything and integration is one `setAnalyticsSink` call. Nothing is
+appended to the Ticketmaster URL: affiliate and tracking parameters are out of
+scope until an affiliate agreement exists, so attribution is recorded on our
+side only.
+
+### Running the discovery tests
+
+```bash
+npm run test:web        # 97 tests across routing, slugs, canonicals,
+                        # metadata, indexability, entity identity,
+                        # structured data, and the sitemap
+```
+
+No test reaches Ticketmaster.
 
 ---
 
