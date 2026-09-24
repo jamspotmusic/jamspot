@@ -45,11 +45,20 @@ export function coverageIncludes() {
   return [
     path.join(BUILD_DIR, "app", "page.js"),
     path.join(BUILD_DIR, "app", "test-concert-query", "page.js"),
+    path.join(BUILD_DIR, "app", "sitemap.js"),
+    path.join(BUILD_DIR, "app", "robots.js"),
     path.join(BUILD_DIR, "components", "ConcertModal.js"),
+    path.join(BUILD_DIR, "components", "EventCard.js"),
     path.join(BUILD_DIR, "components", "StreamingServiceLinks.js"),
     path.join(BUILD_DIR, "components", "SignInForm.js"),
     path.join(BUILD_DIR, "components", "LunaSearch.js"),
+    ...compiledJsFiles(path.join(BUILD_DIR, "components", "discovery")),
     ...compiledJsFiles(path.join(BUILD_DIR, "lib")),
     ...compiledJsFiles(path.join(BUILD_DIR, "app", "api")),
+    // The discovery routes (TEA-67). Their directory names are bracketed, so
+    // they are collected rather than listed one by one.
+    ...compiledJsFiles(path.join(BUILD_DIR, "app", "concerts")),
+    ...compiledJsFiles(path.join(BUILD_DIR, "app", "artists")),
+    ...compiledJsFiles(path.join(BUILD_DIR, "app", "venues")),
   ];
 }
