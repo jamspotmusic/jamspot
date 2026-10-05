@@ -58,7 +58,8 @@ export function ReviewCard({ review }: { review: Review }) {
     counters[type]((prev) => prev + 1);
   };
 
-  const author = review.profiles?.display_name ?? review.profiles?.username;
+  // `profiles` has no display_name column - id, username, created_at only.
+  const author = review.profiles?.username;
   const rating = Math.max(0, Math.min(5, Math.round(review.star_rating)));
 
   // Web decides whether to show the toggle by comparing the clamped
