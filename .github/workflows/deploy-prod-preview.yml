@@ -81,3 +81,7 @@ jobs:
 
       - name: Alias Deployment to jamspot-k7pz.vercel.app
         run: vercel alias set "${{ steps.deploy.outputs.url }}" jamspot-k7pz.vercel.app --token=${{ secrets.VERCEL_TOKEN }}
+
+      # The apex domain redirects to www; update the serving domain as well.
+      - name: Alias Deployment to www.jamspotmusic.app
+        run: vercel alias set "${{ steps.deploy.outputs.url }}" www.jamspotmusic.app --token=${{ secrets.VERCEL_TOKEN }}
