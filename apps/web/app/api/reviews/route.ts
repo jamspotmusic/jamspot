@@ -1,13 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
+import { describeReviewErrors, validateNewReview } from "@jamspot/shared";
 
+import { resolveDisplayName, resolveRequestIdentity } from "@/lib/api-auth";
 import { createReview, getReviews, ReviewsError } from "@/lib/reviews";
-import * as supabaseServer from "@/lib/supabase-server";
-import type { NewReview } from "@jamspot/shared";
 
 /**
  * GET /api/reviews
  *
- * Returns every review, most recent first. Public - no session required.
+ * Returns every review, most recent first. Open to anonymous callers.
  */
 export async function GET() {
   try {
@@ -24,64 +24,30 @@ export async function GET() {
   }
 }
 
-const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
-
-/** A trimmed non-empty string, or null if `value` is not one. */
-function requiredText(value: unknown): string | null {
-  if (typeof value !== "string") return null;
-  const trimmed = value.trim();
-  return trimmed ? trimmed : null;
-}
-
-type ValidationResult =
-  | { ok: true; input: NewReview }
-  | { ok: false; error: string };
-
-function validate(body: Record<string, unknown>): ValidationResult {
-  const shortDescription = requiredText(body.shortDescription);
-  const description = requiredText(body.description);
-  const location = requiredText(body.location);
-  const reviewDate = requiredText(body.reviewDate);
-
-  if (!shortDescription || !description || !location || !reviewDate) {
-    return {
-      ok: false,
-      error:
-        "shortDescription, description, location, and reviewDate are required non-empty strings",
-    };
-  }
-
-  if (!ISO_DATE.test(reviewDate)) {
-    return { ok: false, error: "reviewDate must be an ISO date, e.g. 2026-08-07" };
-  }
-
-  const starRating = body.starRating;
-  if (
-    typeof starRating !== "number" ||
-    !Number.isInteger(starRating) ||
-    starRating < 1 ||
-    starRating > 5
-  ) {
-    return { ok: false, error: "starRating must be an integer from 1 to 5" };
-  }
-
-  return {
-    ok: true,
-    input: { shortDescription, description, starRating, location, reviewDate },
-  };
-}
-
 /**
  * POST /api/reviews
  *
- * Body: { shortDescription, description, starRating, location, reviewDate }
+ * Body: { musician, venue, concertDate, rating, reviewText, aspectRatings? }
  *
- * Requires a signed-in user. `author_id` is taken from the verified session,
- * not the request body, because Row Level Security requires it to match the
- * caller and a client-supplied value would be spoofable.
+ * Requires a signed-in user, supplied either as the web app's session cookie
+ * or as a `Authorization: Bearer <jwt>` header from the mobile app.
+ *
+ * The review's owner is taken from that session and is not readable from the
+ * body: there is no request that can create a review attributed to anyone but
+ * the caller. Sending `user_id` or `user_name` is rejected outright rather
+ * than ignored, so a client doing it finds out.
  */
 export async function POST(request: NextRequest) {
-  let body: Record<string, unknown>;
+  const identity = await resolveRequestIdentity(request);
+
+  if (!identity) {
+    return NextResponse.json(
+      { error: "You must be signed in to write a review." },
+      { status: 401 }
+    );
+  }
+
+  let body: unknown;
   try {
     body = await request.json();
   } catch {
@@ -91,22 +57,20 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  const validated = validate(body);
-  if (!validated.ok) {
-    return NextResponse.json({ error: validated.error }, { status: 400 });
+  const validation = validateNewReview(body);
+  if (!validation.ok) {
+    return NextResponse.json(
+      { error: describeReviewErrors(validation.errors), fields: validation.errors },
+      { status: 400 }
+    );
   }
 
   try {
-    const user = await supabaseServer.getServerUser();
-    if (!user) {
-      return NextResponse.json(
-        { error: "You must be signed in to post a review" },
-        { status: 401 }
-      );
-    }
-
-    const client = await supabaseServer.createClient();
-    const review = await createReview(client, user.id, validated.input);
+    const userName = await resolveDisplayName(identity);
+    const review = await createReview(identity.supabase, validation.value, {
+      id: identity.user.id,
+      userName,
+    });
 
     return NextResponse.json({ review }, { status: 201 });
   } catch (err) {

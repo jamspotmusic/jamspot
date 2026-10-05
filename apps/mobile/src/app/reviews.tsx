@@ -1,36 +1,36 @@
-import { Search } from 'lucide-react-native';
+import { PenLine, Search } from 'lucide-react-native';
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { FlatList, RefreshControl, StyleSheet, Text, View } from 'react-native';
+import { Alert, FlatList, Pressable, RefreshControl, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { isReviewOwner } from '@jamspot/shared';
 
 import { AuthButton } from '@/components/auth-button';
 import { BrandHeader } from '@/components/brand-header';
 import { ReviewCard } from '@/components/review-card';
 import { ReviewCardSkeleton } from '@/components/review-card-skeleton';
+import { ReviewFormModal } from '@/components/review-form-modal';
 import { SearchField } from '@/components/search-field';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { BottomTabInset, Radius, ReviewColors, Spacing } from '@/constants/theme';
+import { useAuth } from '@/hooks/use-auth';
 import { useTheme } from '@/hooks/use-theme';
-import { ApiError, getReviews, type Review } from '@/lib/api';
+import { ApiError, deleteReview, getReviews, type Review } from '@/lib/api';
 
 function describeError(err: unknown) {
   return err instanceof ApiError ? err.message : 'Something went wrong loading reviews.';
 }
 
 /**
- * Matches apps/web/app/reviews-page/page.tsx's search, which joins artist,
- * venue, city, and state into one string and matches against that - notably
- * *not* the review body, so typing a common word doesn't match every review.
- * The live `/api/reviews` rows carry a free-text `location` and a
- * `short_description` rather than separate artist/venue/city/state columns,
- * so those two stand in for the same set.
+ * Matches apps/web/app/reviews-page/page.tsx's search: artist, venue, and
+ * author are searchable, but the review body deliberately is not - otherwise
+ * a common word matches nearly every review.
  */
 export function filterReviews(reviews: Review[], query: string) {
   const normalized = query.trim().toLowerCase();
   if (!normalized) return reviews;
   return reviews.filter((review) =>
-    [review.short_description, review.location].join(' ').toLowerCase().includes(normalized),
+    [review.musician, review.venue, review.user_name].join(' ').toLowerCase().includes(normalized),
   );
 }
 
@@ -41,7 +41,11 @@ export default function ReviewsScreen() {
   const [refreshing, setRefreshing] = useState(false);
   const [searchInput, setSearchInput] = useState('');
   const [query, setQuery] = useState('');
+  // Which form is open: nothing, a new review, or an existing one.
+  const [composing, setComposing] = useState(false);
+  const [editing, setEditing] = useState<Review | null>(null);
   const theme = useTheme();
+  const { status, user } = useAuth();
 
   useEffect(() => {
     let cancelled = false;
@@ -69,6 +73,45 @@ export default function ReviewsScreen() {
       setError(describeError(err));
     }
     setRefreshing(false);
+  }, []);
+
+  const handleSaved = useCallback((saved: Review) => {
+    setReviews((previous) => {
+      if (!previous) return [saved];
+      const existing = previous.findIndex((review) => review.id === saved.id);
+      if (existing === -1) return [saved, ...previous];
+      return previous.map((review) => (review.id === saved.id ? saved : review));
+    });
+    setComposing(false);
+    setEditing(null);
+  }, []);
+
+  /**
+   * Deleting is permanent, so it takes a second, explicit action - the native
+   * equivalent of the confirmation dialog the web app opens.
+   */
+  const confirmDelete = useCallback((review: Review) => {
+    Alert.alert(
+      'Delete this review?',
+      `Your review of ${review.musician} at ${review.venue} will be permanently removed. This cannot be undone.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              await deleteReview(review.id);
+              setReviews((previous) =>
+                previous ? previous.filter((item) => item.id !== review.id) : previous,
+              );
+            } catch (err) {
+              setError(describeError(err));
+            }
+          },
+        },
+      ],
+    );
   }, []);
 
   const filtered = useMemo(() => (reviews ? filterReviews(reviews, query) : []), [reviews, query]);
@@ -104,16 +147,50 @@ export default function ReviewsScreen() {
         <FlatList
           data={isLoading ? [] : filtered}
           keyExtractor={(review) => review.id}
-          renderItem={({ item }) => <ReviewCard review={item} />}
+          renderItem={({ item }) => (
+            <ReviewCard
+              review={item}
+              canManage={isReviewOwner(item, user?.id)}
+              onEdit={(target) => {
+                setComposing(false);
+                setEditing(target);
+              }}
+              onDelete={confirmDelete}
+            />
+          )}
           ItemSeparatorComponent={() => <View style={styles.separator} />}
           contentContainerStyle={styles.listContent}
           refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
           ListHeaderComponent={
             <View style={styles.resultsHeader}>
               <ThemedText type="heading">Reviews</ThemedText>
-              <ThemedText type="mono" themeColor="textSecondary">
-                {filtered.length} review{filtered.length !== 1 ? 's' : ''}
-              </ThemedText>
+              <View style={styles.resultsActions}>
+                <ThemedText type="mono" themeColor="textSecondary">
+                  {filtered.length} review{filtered.length !== 1 ? 's' : ''}
+                </ThemedText>
+                {/* Writing needs an account. Signed-out visitors get no button
+                    rather than one that would fail on submit; the header's
+                    AuthButton is how they sign in. */}
+                {status === 'authenticated' && (
+                  <Pressable
+                    onPress={() => {
+                      setEditing(null);
+                      setComposing(true);
+                    }}
+                    accessibilityRole="button"
+                    accessibilityLabel="Write a review"
+                    style={({ pressed }) => [
+                      styles.writeButton,
+                      { backgroundColor: theme.primary },
+                      pressed && styles.pressed,
+                    ]}>
+                    <PenLine size={14} color={theme.primaryForeground} />
+                    <ThemedText type="small" style={{ color: theme.primaryForeground }}>
+                      Write
+                    </ThemedText>
+                  </Pressable>
+                )}
+              </View>
             </View>
           }
           ListEmptyComponent={
@@ -133,6 +210,17 @@ export default function ReviewsScreen() {
           }
         />
       </SafeAreaView>
+
+      {(composing || editing) && (
+        <ReviewFormModal
+          review={editing ?? undefined}
+          onSaved={handleSaved}
+          onClose={() => {
+            setComposing(false);
+            setEditing(null);
+          }}
+        />
+      )}
     </ThemedView>
   );
 }
@@ -171,6 +259,22 @@ const styles = StyleSheet.create({
     paddingTop: Spacing.four,
     // web: `space-y-6` between the heading row and the card list.
     paddingBottom: Spacing.four,
+  },
+  resultsActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.three,
+  },
+  writeButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.one,
+    borderRadius: Radius.pill,
+    paddingHorizontal: Spacing.three,
+    paddingVertical: Spacing.one + Spacing.half,
+  },
+  pressed: {
+    opacity: 0.7,
   },
   separator: {
     // web: `space-y-4`
