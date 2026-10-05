@@ -1,134 +1,84 @@
 'use client';
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { Music2, Search } from "lucide-react";
 import ReviewCard from "@/components/ReviewCard";
 import ReviewCardSkeleton from "@/components/ReviewCardSkeleton";
 import AuthNav from "@/components/AuthNav";
+import type { Review } from "@jamspot/shared";
 
-export const mockReviews = [
-  {
-    id: "1",
-    author: "Sarah Mitchell",
-    rating: 4,
-    artist: "Massive Attack",
-    venue: "Golden 1 Center",
-    city: "Sacramento",
-    state: "CA",
-    content: "Amazing performance. The visuals were incredible and the sound quality was one of the best I've experienced at a live show.",
-    createdAt: "July 30, 2026",
-    upvotes: 127,
-    downvotes: 6,
-  },
-  {
-  id: "2",
-  author: "David Chen",
-  rating: 3,
-  artist: "The War on Drugs",
-  venue: "Ace of Spades",
-  city: "Sacramento",
-  state: "CA",
-  content:
-    "The band sounded great and the atmosphere was energetic. The guitar work was incredible, and the crowd was really engaged throughout the night. The only downside was that the venue felt a little cramped and it was difficult to get a good view unless you arrived early.",
-  createdAt: "July 28, 2026",
-  upvotes: 54,
-  downvotes: 3,
-},
-{
-  id: "3",
-  author: "Emily Rodriguez",
-  rating: 5,
-  artist: "Lana Del Rey",
-  venue: "Golden Gate Park",
-  city: "San Francisco",
-  state: "CA",
-  content:
-    "One of the most memorable concerts I've ever attended. The vocals were beautiful, the stage design was stunning, and the entire performance felt like a cinematic experience. Everything from the lighting to the setlist was thoughtfully done.",
-  createdAt: "July 24, 2026",
-  upvotes: 201,
-  downvotes: 9,
-},
-{
-  id: "4",
-  author: "Michael Thompson",
-  rating: 4,
-  artist: "Tame Impala",
-  venue: "Chase Center",
-  city: "San Francisco",
-  state: "CA",
-  content:
-    "The visuals were absolutely amazing and matched the music perfectly. The sound quality was excellent, and the band delivered a great performance. The only issue was that the lines for drinks were extremely long during the show.",
-  createdAt: "July 20, 2026",
-  upvotes: 89,
-  downvotes: 5,
-},
-{
-  id: "5",
-  author: "Olivia Martinez",
-  rating: 4,
-  artist: "Billie Eilish",
-  venue: "Golden 1 Center",
-  city: "Sacramento",
-  state: "CA",
-  content:
-    "Fantastic show from start to finish. Billie had incredible stage presence, and the crowd energy made the experience even better. The production quality was on another level, with amazing lighting and visuals that made every song feel unique.",
-  createdAt: "July 15, 2026",
-  upvotes: 342,
-  downvotes: 12,
-},
-];
+/**
+ * Matches apps/mobile/src/app/reviews.tsx's `filterReviews`, so both clients
+ * search the same fields. The live rows carry a free-text `location` and a
+ * `short_description` rather than separate artist/venue/city/state columns.
+ * The review body is deliberately excluded: matching on it would make a
+ * common word hit nearly every review.
+ */
+export function filterReviews(reviews: Review[], query: string) {
+    const normalized = query.trim().toLowerCase();
+    if (!normalized) return reviews;
+    return reviews.filter((review) =>
+        [review.short_description, review.location]
+            .join(" ")
+            .toLowerCase()
+            .includes(normalized),
+    );
+}
 
 export default function ReviewsPage() {
     const [searchInput, setSearchInput] = useState("");
-    const [isLoading, setIsLoading] = useState(true);
-    const [reviews, setReviews] = useState<typeof mockReviews>([]);
+    const [query, setQuery] = useState("");
+    const [reviews, setReviews] = useState<Review[] | null>(null);
+    const [error, setError] = useState<string | null>(null);
 
     useEffect(() => {
-        async function loadReviews() {
-            setIsLoading(true);
+        let cancelled = false;
 
+        async function loadReviews() {
             try {
-                // Temporary mock data Replace this with API call later
-                setReviews(mockReviews);
-            } catch (error) {
-                console.error("Failed to load reviews:", error);
-            } finally {
-                setIsLoading(false);
+                const response = await fetch("/api/reviews");
+                const body = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(body?.error ?? "Failed to load reviews");
+                }
+
+                if (!cancelled) {
+                    setReviews(body.reviews ?? []);
+                    setError(null);
+                }
+            } catch (err) {
+                console.error("Failed to load reviews:", err);
+                if (!cancelled) {
+                    setError(
+                        err instanceof Error
+                            ? err.message
+                            : "Something went wrong loading reviews.",
+                    );
+                }
             }
         }
 
         loadReviews();
+
+        return () => {
+            cancelled = true;
+        };
     }, []);
 
-    const handleSearch = async (e: React.SyntheticEvent<HTMLFormElement>) => {
+    // Searching filters the rows already loaded rather than refetching, which
+    // is what the mobile screen does and keeps the count below in step.
+    const filtered = useMemo(
+        () => (reviews ? filterReviews(reviews, query) : []),
+        [reviews, query],
+    );
+
+    const isLoading = !reviews && !error;
+
+    const handleSearch = (e: React.SyntheticEvent<HTMLFormElement>) => {
         e.preventDefault();
-
-        setIsLoading(true);
-
-        try {
-            const query = searchInput.toLowerCase().trim();
-
-            const filtered = mockReviews.filter((review) => {
-                const searchableText = [
-                    review.artist,
-                    review.venue,
-                    review.city,
-                    review.state,
-                    `${review.city}, ${review.state}`,
-                ]
-                    .join(" ")
-                    .toLowerCase();
-
-                return searchableText.includes(query);
-            });
-            setReviews(filtered);
-        } catch (error) {
-            console.error("Failed to search reviews:", error);
-            setReviews([]);
-        } finally {
-            setIsLoading(false);
-        }
+        setQuery(searchInput);
     };
 
     return (
@@ -209,7 +159,7 @@ export default function ReviewsPage() {
                         className="text-sm text-muted-foreground"
                         style={{ fontFamily: "'DM Mono', monospace" }}
                     >
-                        {reviews.length} review{reviews.length !== 1 ? "s" : ""}
+                        {filtered.length} review{filtered.length !== 1 ? "s" : ""}
                     </span>
                 </div>
 
@@ -219,8 +169,10 @@ export default function ReviewsPage() {
                         Array.from({ length: 3 }).map((_, index) => (
                             <ReviewCardSkeleton key={index} />
                         ))
-                    ) : reviews.length > 0 ? (
-                        reviews.map((review) => (
+                    ) : error ? (
+                        <p className="text-center text-review-muted">{error}</p>
+                    ) : filtered.length > 0 ? (
+                        filtered.map((review) => (
                             <ReviewCard
                                 key={review.id}
                                 review={review}

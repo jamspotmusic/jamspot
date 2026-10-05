@@ -12,6 +12,23 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+/** A row in the shape the live `reviews` table actually returns. */
+function reviewRow(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "1",
+    short_description: "Massive Attack at Golden 1 Center",
+    description: "Amazing performance.",
+    star_rating: 4,
+    location: "Golden 1 Center, Sacramento, CA",
+    review_date: "2026-07-30",
+    created_at: "2026-07-31T00:00:00Z",
+    updated_at: "2026-07-31T00:00:00Z",
+    author_id: "author-1",
+    profiles: null,
+    ...overrides,
+  };
+}
+
 function context(id: string) {
   return { params: Promise.resolve({ id }) };
 }
@@ -19,7 +36,7 @@ function context(id: string) {
 test("GET /api/reviews/[id] returns the matching review", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () =>
-    jsonResponse({ id: "1", musician: "Nova Bloom", venue: "The Granada", concert_date: "2026-05-01", review_text: "Great show", venue_city: null, venue_state: null, venue_country: null, user_name: null, created_at: "2026-05-02T00:00:00Z" });
+    jsonResponse(reviewRow());
   try {
     const response = await GET(new NextRequest("http://localhost/api/reviews/1"), context("1"));
     assert.equal(response.status, 200);
