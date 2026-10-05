@@ -5,9 +5,18 @@ import { useState, useEffect, useMemo } from "react";
 import Image from "next/image";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Search, MapPin, Ticket, Music2, Calendar, Clock, X } from "lucide-react";
+import { MapPin, Ticket, Music2, Calendar, Clock, X } from "lucide-react";
 
 import type { NormalizedConcert } from "@/lib/ticketmaster";
+import {
+  EventCard,
+  EventCardSkeleton,
+  formatDate,
+  formatPriceRange,
+  formatTime,
+  toCardEvent,
+  type CardEvent,
+} from "@/components/EventCard";
 import type { NormalizedArtistBio } from "@/lib/lastfm";
 import type { NormalizedSpotifyArtist } from "@/lib/spotify";
 import type { NormalizedAppleMusicArtist } from "@/lib/apple-music";
@@ -15,110 +24,42 @@ import StreamingServiceLinks from "../components/StreamingServiceLinks";
 import AuthNav from "../components/AuthNav";
 import LunaSearch from "@/components/LunaSearch";
 
-const FALLBACK_IMAGE = "https://picsum.photos/400/250?random=1";
-
-/** Shape the UI renders. Derived from the Ticketmaster API's normalized concert data. */
-export type CardEvent = {
-  id: string;
-  artist: string;
-  venue: string;
-  city: string;
-  state: string;
-  date: string;
-  time: string;
-  genre: string;
-  priceRange: string | null;
-  image: string;
-  ticketUrl: string | null;
+/**
+ * The card UI moved to components/EventCard.tsx when the discovery pages
+ * landed (TEA-67), so the search results and the city/genre/artist/venue pages
+ * render the same component. Re-exported here so this module's surface is
+ * unchanged for everything that already imports from it.
+ */
+export {
+  EventCard,
+  EventCardSkeleton,
+  formatDate,
+  formatPriceRange,
+  formatTime,
+  toCardEvent,
+  type CardEvent,
 };
 
-export function formatPriceRange(
-  priceRange: NormalizedConcert["priceRange"],
-): string | null {
-  if (!priceRange) return null;
-  const { min, max, currency } = priceRange;
-  const symbol = currency === "USD" ? "$" : `${currency} `;
-  if (min === max) return `${symbol}${min}`;
-  return `${symbol}${min} - ${symbol}${max}`;
-}
-
-export function formatDate(date: string | null | undefined): string {
-  if (!date) return "Date TBA";
-
-  return new Intl.DateTimeFormat("en-US", {
-    month: 'short',
-    day: 'numeric',
-    year: 'numeric',
-  }).format(new Date(date));
-}
-
-export function formatTime(time: string | null | undefined): string {
-  if (!time) return "Time TBA";
-
-  const [hours, minutes] = time.split(":").map(Number);
-
-  const date = new Date();
-  date.setHours(hours,minutes);
-
-  return new Intl.DateTimeFormat("en-US", {
-    hour: 'numeric',
-    minute: '2-digit',
-    hour12: true,
-  }).format(date)
-}
-
-export function toCardEvent(concert: NormalizedConcert): CardEvent {
-  return {
-    id: concert.id,
-    artist: concert.artist ?? concert.name,
-    venue: concert.venue ?? "Venue TBA",
-    city: concert.city ?? "",
-    state: concert.state ?? "",
-    date: formatDate(concert.date),
-    time: formatTime(concert.time),
-    genre: concert.genre ?? "Other",
-    priceRange: formatPriceRange(concert.priceRange),
-    image: concert.imageUrl ?? FALLBACK_IMAGE,
-    ticketUrl: concert.ticketUrl,
-  };
-}
-
+/**
+ * The genre chips are the only filter applied after the fetch.
+ *
+ * There used to be a text and a location filter here as well, narrowing the
+ * results by whatever was in the two search inputs. With one field left, the
+ * words in it are search *parameters* - Luna turns them into a keyword, a
+ * genre, a date, a place - so re-applying them to the response would throw
+ * away events that match the search the user actually got.
+ */
 export function filterCardEvents(
   events: CardEvent[],
-  search: string,
-  location: string,
   activeGenre: string,
 ): CardEvent[] {
-  const query = search.trim().toLowerCase();
-  const normalizedLocation = location.trim().toLowerCase();
+  if (activeGenre === "All") return events;
 
-  return events.filter((event) => {
-    const matchesGenre =
-      activeGenre === "All" || event.genre === activeGenre;
-    const searchableText = [
-      event.artist,
-      event.venue,
-      event.city,
-      event.state,
-      event.genre,
-    ]
-      .join(" ")
-      .toLowerCase();
-    const matchesSearch = !query || searchableText.includes(query);
-    const matchesLocation =
-      !normalizedLocation ||
-      event.city.toLowerCase().includes(normalizedLocation) ||
-      event.state.toLowerCase().includes(normalizedLocation);
-
-    return matchesGenre && matchesSearch && matchesLocation;
-  });
+  return events.filter((event) => event.genre === activeGenre);
 }
 
 export default function Home() {
-  const [searchInput, setSearchInput] = useState("");
-  const [search, setSearch] = useState("");
-  const [locationInput, setLocationInput] = useState("");
-  const [location, setLocation] = useState("");
+  const [query, setQuery] = useState("");
   const [activeGenre, setActiveGenre] = useState("All");
   const [hasSearched, setHasSearched] = useState(false);
   const [isLoadingMore, setIsLoadingMore] = useState(false);
@@ -131,72 +72,16 @@ export default function Home() {
 
   const pathname = usePathname();
 
-  // Fetch concerts from our Ticketmaster-backed API route whenever a search
-
-  // (keyword and/or location) has been submitted.
-  useEffect(() => {
-    if (!hasSearched) return;
-    if (!search && !location) return;
-
-    const controller = new AbortController();
-
-    const fetchConcerts = async () => {
-      setIsLoading(true);
-      setFetchError(null);
-
-      const params = new URLSearchParams();
-      if (search.length >= 3) {
-        params.set("keyword", search);
-      }
-      if (location) {
-        if (/^[a-z]{2}$/i.test(location)) {
-          params.set("stateCode", location.toUpperCase());
-        } else {
-          params.set("city", location);
-        }
-      }
-
-      try {
-        const res = await fetch(`/api/concerts?${params.toString()}`, {
-          signal: controller.signal,
-        });
-        const data = await res.json();
-
-        if (!res.ok) {
-          throw new Error(data?.error ?? "Failed to load concerts");
-        }
-        const concerts = (data.concerts ?? []) as NormalizedConcert[];
-
-        setEvents(concerts.map(toCardEvent));
-      } catch (err) {
-        if (err instanceof DOMException && err.name === "AbortError") return;
-        setFetchError(
-          err instanceof Error ? err.message : "Failed to load concerts",
-        );
-        setEvents([]);
-      } finally {
-        setIsLoading(false);
-      }
-    };
-
-    fetchConcerts();
-
-    return () => controller.abort();
-  }, [hasSearched, search, location]);
-
   const initialLimit = 6;
   const itemsPerLoad = 6;
 
   const [visibleCount, setVisibleCount] = useState(initialLimit);
-   // Luna's one-line description of the search it built (TEA-47), shown above
-  // the results so the user can see how their words were read.
-  //
-  // Declared last on purpose: tests/unit/home-hooks.test.cjs drives this
-  // component with a positional useState stub, so appending here leaves every
-  // existing hook index untouched.
-  const [lunaInterpretation, setLunaInterpretation] = useState<string | null>(
-    null,
-  );
+
+  // One line describing the search that produced these results, shown above
+  // them: Luna's reading of the query, or the state a bare state code meant.
+  const [searchInterpretation, setSearchInterpretation] = useState<
+    string | null
+  >(null);
 
   // Genres available, derived from the fetched events so the chips only
   // ever show options that actually have results. Ticketmaster searches
@@ -208,8 +93,8 @@ export default function Home() {
   ];
 
   const filtered = useMemo(
-    () => filterCardEvents(events, search, location, activeGenre),
-    [events, search, location, activeGenre],
+    () => filterCardEvents(events, activeGenre),
+    [events, activeGenre],
   );
 
   const currentYear = new Date().getFullYear();
@@ -241,40 +126,31 @@ export default function Home() {
     }
   };
 
-  const handleSearch = (e: React.SyntheticEvent<HTMLFormElement>) => {
-    e.preventDefault();
-
-    const formData = new FormData(e.currentTarget);
-
-    const query = String(formData.get("search") ?? "").trim();
-    const loc = String(formData.get("location") ?? "").trim();
-
-    setSearchInput(query);
-    setLocationInput(loc);
-
-    setSearch(query);
-    setLocation(loc);
-
-    setHasSearched(true);
-    setVisibleCount(initialLimit);
-    setLunaInterpretation(null);
-
-    const matchedGenre = genres.find(
-      (genre) => 
-        genre !== "All" &&
-        query.toLowerCase().includes(genre.toLowerCase()),
-    );
-
-    setActiveGenre(matchedGenre ?? "All");
-  };
-
-  const handleSearchKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Enter") {
-      e.preventDefault();
-
-      const form = e.currentTarget.form;
-      form?.requestSubmit();
-    }
+  /*
+   * LunaSearch runs the whole search - it resolves the query and fetches
+   * /api/concerts itself - so the page only reacts to the three points that
+   * change what is on screen. Kept in one object because the field moves
+   * between the hero and the header and both placements behave identically.
+   */
+  const searchHandlers = {
+    onSearchStart: (interpretation?: string) => {
+      setFetchError(null);
+      setEvents([]);
+      setActiveGenre("All");
+      setVisibleCount(initialLimit);
+      setSearchInterpretation(interpretation ?? null);
+      setHasSearched(true);
+      setIsLoading(true);
+    },
+    onSearchSuccess: (concerts: NormalizedConcert[]) => {
+      setEvents(concerts.map(toCardEvent));
+      setIsLoading(false);
+    },
+    onSearchError: (message: string) => {
+      setFetchError(message);
+      setEvents([]);
+      setIsLoading(false);
+    },
   };
 
   const handleGenreClick = (g: string) => {
@@ -332,37 +208,20 @@ export default function Home() {
             </Link>
           </nav>
 
-          {/* Search bar */}
-          <form 
-            className="flex flex-1 items-center gap-2 max-w-2xl ml-auto"
-            autoComplete="off"
-            onSubmit={handleSearch}
-            >
-            <div className="flex-1 flex items-center gap-2 bg-muted rounded-lg px-3 py-2 border border-border focus-within:border-primary/50 transition-colors">
-              <Search size={15} className="text-muted-foreground shrink-0" />
-              <input
-                type="text"
-                name="search"
-                placeholder="Artist, venue, event, or genre..."
-                value={searchInput}
-                onChange={(e) => setSearchInput(e.target.value)}
-                onKeyDown={handleSearchKeyDown}
-                className="flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground outline-none w-full truncate"
+          {/* The search field lives in the hero until the first search, then
+              moves up here so it stays reachable above the results. Only ever
+              one of the two is mounted, and the query is held by this page,
+              so what the user typed survives the move. */}
+          <div className="flex flex-1 justify-end">
+            {hasSearched && (
+              <LunaSearch
+                variant="header"
+                value={query}
+                onChange={setQuery}
+                {...searchHandlers}
               />
-            </div>
-            <div className="hidden sm:flex items-center gap-2 bg-muted rounded-lg px-3 py-2 border border-border focus-within:border-primary/50 transition-colors w-44">
-              <MapPin size={15} className="text-muted-foreground shrink-0" />
-              <input
-                type="text"
-                name="location"
-                placeholder="City or state"
-                value={locationInput}
-                onChange={(e) => setLocationInput(e.target.value)}
-                onKeyDown={handleSearchKeyDown}
-                className="flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground outline-none w-full truncate"
-              />
-            </div>
-          </form>
+            )}
+          </div>
 
           <AuthNav />
         </div>
@@ -394,34 +253,21 @@ export default function Home() {
               Find your next Jam
             </h1>
 
-            {/* TEA-47: natural-language search via the concert-query Supabase
-                Edge Function. Feeds the same /api/concerts route and the same
-                card grid the keyword search above uses - it only ever calls
-                Home's existing setters, and never touches OpenAI directly. */}
+            {/* JamSpot's only search field (TEA-51). A bare state goes
+                straight to Ticketmaster; everything else goes through the
+                concert-query Edge Function first. Both end up at the same
+                /api/concerts route and the same card grid. */}
             <LunaSearch
-              onSearchStart={(interpretation) => {
-                setFetchError(null);
-                setEvents([]);
-                setSearchInput("");
-                setSearch("");
-                setLocationInput("");
-                setLocation("");
-                setActiveGenre("All");
-                setVisibleCount(initialLimit);
-                setLunaInterpretation(interpretation ?? null);
-                setHasSearched(true);
-                setIsLoading(true);
-              }}
-              onSearchSuccess={(concerts) => {
-                setEvents(concerts.map(toCardEvent));
-                setIsLoading(false);
-              }}
-              onSearchError={(message) => {
-                setFetchError(message);
-                setEvents([]);
-                setIsLoading(false);
-              }}
+              variant="hero"
+              value={query}
+              onChange={setQuery}
+              {...searchHandlers}
             />
+
+            <p className="max-w-xl text-center text-sm text-white/60">
+              Ask for a mood, an artist, a night out, or a price - or type a
+              state to see everything playing there.
+            </p>
           </div>
         </section>
       ) : (
@@ -463,10 +309,10 @@ export default function Home() {
             </span>
           </div>
 
-          {/* TEA-47: Luna's read of the query, when the search came from it. */}
-          {lunaInterpretation && (
+          {/* How the query was read - Luna's sentence, or the state it named. */}
+          {searchInterpretation && (
             <p className="-mt-3 mb-6 text-sm text-muted-foreground">
-              {lunaInterpretation}
+              {searchInterpretation}
             </p>
           )}
 
@@ -565,129 +411,6 @@ export default function Home() {
       )}
     </div>
   );
-}
-
-export function EventCard({
-  event,
-  onOpen,
-  onTicketClick,
-}: {
-  event: CardEvent;
-  onOpen: (event: CardEvent) => void;
-  onTicketClick: (event: CardEvent) => void;
-}) {
-  return (
-    <li
-      onClick={() => onOpen(event)} 
-      className="group relative overflow-hidden rounded-xl bg-card border border-border hover:border-primary/30 transition-all hover:-translate-y-0.5 duration-200 cursor-pointer"
-    >
-      {/* Image */}
-      <div className="relative h-44 overflow-hidden bg-muted">
-        <Image
-          src={event.image}
-          alt={`${event.artist} live`}
-          fill
-          sizes="(max-width: 768px) 100vw, (max-width: 1200px) 50vw, 33vw"
-          className="object-cover opacity-70 group-hover:opacity-85 group-hover:scale-105 transition-all duration-500"
-        />
-
-        <div className="absolute inset-0 bg-gradient-to-t from-card via-card/30 to-transparent" />
-
-        {/* Genre badge */}
-        <div className="absolute top-3 left-3">
-          <span
-            className="text-[10px] font-medium px-2 py-0.5 rounded bg-black/60 border border-white/10 text-white/80 backdrop-blur-sm"
-            style={{ fontFamily: "'DM Mono', monospace" }}
-          >
-            {event.genre}
-          </span>
-        </div>
-
-        {/* Date overlay */}
-        <div className="absolute bottom-3 left-3 right-3 flex items-end justify-between">
-          <div>
-            <p
-              className="text-[10px] text-primary/80 font-medium"
-              style={{ fontFamily: "'DM Mono', monospace" }}
-            >
-              {event.date}
-            </p>
-            <p
-              className="text-xs text-white/60"
-              style={{ fontFamily: "'DM Mono', monospace" }}
-            >
-              {event.time}
-            </p>
-          </div>
-        </div>
-      </div>
-
-      {/* Card body */}
-      <div className="p-4">
-        <h3
-          className="text-base font-black text-foreground leading-tight mb-1 group-hover:text-primary transition-colors"
-          style={{
-            fontFamily: "'Unbounded', sans-serif",
-            fontSize: "0.875rem",
-          }}
-        >
-          {event.artist}
-        </h3>
-        <p className="text-sm text-muted-forground flex items-center gap-1 mb-4">
-          <MapPin size={11} className="shrink-0" />
-          {event.venue} · {event.city}, {event.state}
-        </p>
-
-        <div className="flex items-center justify-between">
-          <span
-            className="text-foreground font-semibold text-sm"
-            style={{ fontFamily: "'DM Mono', monospace" }}
-          >
-            {event.priceRange}
-          </span>
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              onTicketClick(event);
-            }}
-            disabled={!event.ticketUrl}
-            className="
-                flex items-center gap-1.5 text-xs bg-primary/10 hover:bg-primary/20 border border-primary/20 hover:border-primary/40 
-                text-primary font-medium px-3 py-1.5 rounded-lg transition-all cursor-pointer 
-                disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-primary/10 disabled:hover:border-primary/20"
-          >
-            <Ticket size={12} />
-            {event.ticketUrl ? "Get Tickets" : "Unavailable"}
-          </button>
-        </div>
-      </div>
-    </li>
-  );
-}
-
-export function EventCardSkeleton() {
-  return (
-    <li className="overflow-hidden rounded-xl bg-card border border-border">
-      {/* Image skeleton */}
-      <div className="h-44 bg-muted animate-pulse" />
-
-      {/* Card body skeleton */}
-      <div className="p-4 space-y-4">
-        {/* Artist */}
-        <div className="h-4 w-3/4 rounded bg-muted animate-pulse" />
-
-        {/* Venue */}
-        <div className="h-3 w-full rounded bg-muted animate-pulse" />
-        <div className="h-3 w-2/3 rounded bg-muted animate-pulse" />
-
-        {/* Bottom row */}
-        <div className="flex items-center justify-between pt-2">
-          <div className="h-4 w-20 rounded bg-muted animate-pulse" />
-          <div className="h-8 w-28 rounded-lg bg-muted animate-pulse" />
-        </div>
-      </div>
-    </li>
-  )
 }
 
 interface EventDetailsModalProps {

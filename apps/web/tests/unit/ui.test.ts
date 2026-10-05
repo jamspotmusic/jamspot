@@ -76,7 +76,9 @@ test("normalizes Ticketmaster concerts for the card UI", () => {
     id: "fallback-event",
     name: "Fallback Artist",
     artist: null,
+    artistId: null,
     venue: null,
+    venueId: null,
     city: null,
     state: null,
     date: null,
@@ -99,7 +101,7 @@ test("normalizes Ticketmaster concerts for the card UI", () => {
   assert.match(card.image, /^https:\/\/picsum\.photos\//);
 });
 
-test("filters cards by text, location, and genre", () => {
+test("filters cards by genre, and by nothing else", () => {
   const events: CardEvent[] = [
     baseEvent,
     {
@@ -112,23 +114,26 @@ test("filters cards by text, location, and genre", () => {
     },
   ];
 
-  assert.deepEqual(filterCardEvents(events, "", "", "All"), events);
-  assert.deepEqual(filterCardEvents(events, "nova", "", "All"), [events[0]]);
-  assert.deepEqual(filterCardEvents(events, "mohawk", "", "All"), [events[1]]);
-  assert.deepEqual(filterCardEvents(events, "", "tx", "All"), events);
-  assert.deepEqual(filterCardEvents(events, "", "Austin", "All"), [events[1]]);
-  assert.deepEqual(filterCardEvents(events, "", "", "Rock"), [events[0]]);
-  assert.deepEqual(filterCardEvents(events, "nova", "Austin", "Rock"), []);
+  assert.deepEqual(filterCardEvents(events, "All"), events);
+  assert.deepEqual(filterCardEvents(events, "Rock"), [events[0]]);
+  assert.deepEqual(filterCardEvents(events, "Electronic"), [events[1]]);
+  assert.deepEqual(filterCardEvents(events, "Jazz"), []);
 });
 
-test("renders the initial home UI", () => {
+test("renders the initial home UI with one search field", () => {
   const html = render(React.createElement(Home));
 
   assert.match(html, /Find your next Jam/);
-  assert.match(html, /Artist, venue, event, or genre/);
-  assert.match(html, /City or state/);
+  assert.match(html, /Ask Luna/);
   assert.match(html, /Events are updated daily/);
   assert.match(html, /Massive Attack/);
+
+  // The keyword and location inputs the Luna field replaced (TEA-51).
+  assert.doesNotMatch(html, /Artist, venue, event, or genre/);
+  assert.doesNotMatch(html, /City or state/);
+
+  // Before the first search the field is in the hero and nowhere else.
+  assert.equal(html.match(/name="luna"/g)?.length, 1);
 });
 
 test("renders event cards, disabled ticket states, and skeletons", () => {

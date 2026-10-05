@@ -22,6 +22,21 @@ Module._load = function load(request, parent, isMain) {
         forward() {},
         prefetch() {},
       }),
+      // The discovery routes (TEA-67) leave a route by throwing, exactly as
+      // the real notFound()/redirect() do. Tests assert on the thrown error
+      // rather than on a return value, so the digest strings below stand in
+      // for Next's own - what matters is that control does not continue past
+      // the call, which a stub returning undefined would not reproduce.
+      notFound: () => {
+        const error = new Error("NEXT_HTTP_ERROR_FALLBACK;404");
+        error.digest = "NEXT_HTTP_ERROR_FALLBACK;404";
+        throw error;
+      },
+      redirect: (url) => {
+        const error = new Error(`NEXT_REDIRECT;replace;${url};308;`);
+        error.digest = `NEXT_REDIRECT;replace;${url};308;`;
+        throw error;
+      },
     };
   }
 

@@ -65,6 +65,45 @@ export async function mockConcertsError(
   });
 }
 
+/**
+ * Intercepts the `concert-query` Edge Function, which is what a query that
+ * isn't a bare state goes through before it reaches /api/concerts. Keeps
+ * these tests off Supabase and off OpenAI - a live call would cost a token
+ * spend per test run and return something different every time.
+ */
+export async function mockConcertQuery(
+  page: Page,
+  body: {
+    ticketmasterParams: Record<string, string | number>;
+    interpretation?: string;
+    filters?: Record<string, string | number>;
+  },
+) {
+  await page.route("**/functions/v1/concert-query**", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(body),
+    });
+  });
+}
+
+/** The Edge Function refusing a query - an out-of-scope one, say. */
+export async function mockConcertQueryError(
+  page: Page,
+  message: string,
+  code?: string,
+  status = 422,
+) {
+  await page.route("**/functions/v1/concert-query**", async (route) => {
+    await route.fulfill({
+      status,
+      contentType: "application/json",
+      body: JSON.stringify({ error: message, ...(code ? { code } : {}) }),
+    });
+  });
+}
+
 type ArtistMockOptions = {
   bio?: {
     name: string;
