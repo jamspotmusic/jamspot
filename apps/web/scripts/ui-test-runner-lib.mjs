@@ -10,6 +10,7 @@ export const REQUIRE_FLAGS = [
   "--require=./tests/unit/register-next-image-stub.cjs",
   "--require=./tests/unit/register-next-navigation-stub.cjs",
   "--require=./tests/unit/register-auth-stub.cjs",
+  "--require=./tests/unit/register-next-headers-stub.cjs",
 ];
 
 /** Every compiled *.test.ts under tests/unit, plus the hand-written *.test.cjs files. */
