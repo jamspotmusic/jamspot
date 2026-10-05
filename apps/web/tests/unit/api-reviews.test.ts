@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { NextRequest } from "next/server";
+import { createClient } from "@supabase/supabase-js";
 
 import { GET, POST } from "../../app/api/reviews/route";
+import * as apiAuth from "../../lib/api-auth";
 import * as reviewsLib from "../../lib/reviews";
-import * as supabaseServer from "../../lib/supabase-server";
-import { supabase } from "../../lib/supabase";
+import { todayIsoDate } from "@jamspot/shared";
+
+const OWNER = "0d6638c2-1340-4b79-8722-e378bade9f82";
+const OTHER = "11111111-1111-1111-1111-111111111111";
+const TODAY = todayIsoDate();
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -14,87 +19,113 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
-function postRequest(body: string) {
+function postRequest(body: string, headers: Record<string, string> = {}) {
   return new NextRequest("http://localhost/api/reviews", {
     method: "POST",
     body,
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...headers },
   });
 }
 
-/** A row in the shape the live `reviews` table actually returns. */
-function reviewRow(overrides: Record<string, unknown> = {}) {
+/**
+ * Run `fn` with the route's identity resolution replaced.
+ *
+ * `null` stands in for an anonymous caller. Patching the module's exports is
+ * how the rest of this suite substitutes collaborators (see the reviewsLib
+ * patches below), and it works because tsc's CommonJS output calls through the
+ * module object rather than capturing the binding.
+ */
+async function withIdentity(userId: string | null, fn: () => Promise<void>) {
+  const originalResolve = apiAuth.resolveRequestIdentity;
+  const originalName = apiAuth.resolveDisplayName;
+
+  Object.assign(apiAuth, {
+    resolveRequestIdentity: async () =>
+      userId === null
+        ? null
+        : {
+            user: { id: userId, email: `${userId}@example.com` },
+            supabase: createClient("https://example.supabase.co", "sb_publishable_test"),
+          },
+    resolveDisplayName: async () => "jamfan",
+  });
+
+  try {
+    await fn();
+  } finally {
+    Object.assign(apiAuth, {
+      resolveRequestIdentity: originalResolve,
+      resolveDisplayName: originalName,
+    });
+  }
+}
+
+async function withFetch(handler: () => Response, fn: () => Promise<void>) {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => handler();
+  try {
+    await fn();
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+function validBody(overrides: Record<string, unknown> = {}) {
+  return JSON.stringify({
+    musician: "Nova Bloom",
+    venue: "The Granada",
+    concertDate: "2026-05-01",
+    rating: 4,
+    reviewText: "Great show",
+    ...overrides,
+  });
+}
+
+function row(overrides: Record<string, unknown> = {}) {
   return {
-    id: "1",
-    short_description: "Massive Attack at Golden 1 Center",
-    description: "Amazing performance.",
-    star_rating: 4,
-    location: "Golden 1 Center, Sacramento, CA",
-    review_date: "2026-07-30",
-    created_at: "2026-07-31T00:00:00Z",
-    updated_at: "2026-07-31T00:00:00Z",
-    author_id: "author-1",
-    profiles: null,
+    id: "new-1",
+    user_id: OWNER,
+    user_name: "jamfan",
+    musician: "Nova Bloom",
+    venue: "The Granada",
+    concert_date: "2026-05-01",
+    rating: 4,
+    rating_performance: null,
+    rating_sound: null,
+    rating_venue: null,
+    rating_crowd: null,
+    rating_value: null,
+    review_text: "Great show",
+    created_at: "2026-05-02T00:00:00Z",
+    updated_at: "2026-05-02T00:00:00Z",
     ...overrides,
   };
 }
 
-const validBody = {
-  shortDescription: "Massive Attack at Golden 1 Center",
-  description: "Amazing performance.",
-  starRating: 4,
-  location: "Golden 1 Center, Sacramento, CA",
-  reviewDate: "2026-07-30",
-};
-
-/**
- * The route reads the caller through lib/supabase-server, which needs real
- * request cookies. Swap both of its exports for the duration of a test: the
- * anonymous client is enough here because the outbound fetch is stubbed too.
- */
-async function withUser(
-  user: { id: string } | null,
-  run: () => Promise<void>,
-) {
-  const original = {
-    getServerUser: supabaseServer.getServerUser,
-    createClient: supabaseServer.createClient,
-  };
-  Object.assign(supabaseServer, {
-    getServerUser: async () => user,
-    createClient: async () => supabase,
-  });
-  try {
-    await run();
-  } finally {
-    Object.assign(supabaseServer, original);
-  }
-}
+// ---------------------------------------------------------------------------
+// GET - open to everyone
+// ---------------------------------------------------------------------------
 
 test("GET /api/reviews returns the review list", async () => {
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => jsonResponse([reviewRow()]);
-  try {
-    const response = await GET();
-    assert.equal(response.status, 200);
-    const body = await response.json();
-    assert.equal(body.reviews.length, 1);
-    assert.equal(body.reviews[0].star_rating, 4);
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
+  await withFetch(
+    () => jsonResponse([row()]),
+    async () => {
+      const response = await GET();
+      assert.equal(response.status, 200);
+      assert.equal((await response.json()).reviews.length, 1);
+    },
+  );
 });
 
 test("GET /api/reviews maps a ReviewsError to 502", async () => {
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => jsonResponse({ message: "db down" }, 500);
-  try {
-    const response = await GET();
-    assert.equal(response.status, 502);
-    assert.match((await response.json()).error, /db down/);
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
+  await withFetch(
+    () => jsonResponse({ message: "db down" }, 500),
+    async () => {
+      const response = await GET();
+      assert.equal(response.status, 502);
+      assert.match((await response.json()).error, /db down/);
+    },
+  );
 });
 
 test("GET /api/reviews returns 500 for a non-ReviewsError", async () => {
@@ -113,101 +144,185 @@ test("GET /api/reviews returns 500 for a non-ReviewsError", async () => {
   }
 });
 
-test("POST /api/reviews rejects invalid JSON", async () => {
-  const response = await POST(postRequest("{not valid json"));
-  assert.equal(response.status, 400);
-  assert.match((await response.json()).error, /must be valid JSON/);
-});
+// ---------------------------------------------------------------------------
+// Authentication
+// ---------------------------------------------------------------------------
 
-test("POST /api/reviews rejects a body missing required fields", async () => {
-  const response = await POST(postRequest(JSON.stringify({ description: "just this" })));
-  assert.equal(response.status, 400);
-  assert.match((await response.json()).error, /are required non-empty strings/);
-});
-
-test("POST /api/reviews rejects whitespace-only text", async () => {
-  const response = await POST(
-    postRequest(JSON.stringify({ ...validBody, shortDescription: "   " })),
-  );
-  assert.equal(response.status, 400);
-  assert.match((await response.json()).error, /are required non-empty strings/);
-});
-
-test("POST /api/reviews rejects a malformed reviewDate", async () => {
-  const response = await POST(
-    postRequest(JSON.stringify({ ...validBody, reviewDate: "July 30, 2026" })),
-  );
-  assert.equal(response.status, 400);
-  assert.match((await response.json()).error, /must be an ISO date/);
-});
-
-test("POST /api/reviews rejects an out-of-range starRating", async () => {
-  for (const starRating of [0, 6, 3.5, "4"]) {
-    const response = await POST(postRequest(JSON.stringify({ ...validBody, starRating })));
-    assert.equal(response.status, 400);
-    assert.match((await response.json()).error, /integer from 1 to 5/);
-  }
-});
-
-test("POST /api/reviews returns 401 when nobody is signed in", async () => {
-  await withUser(null, async () => {
-    const response = await POST(postRequest(JSON.stringify(validBody)));
+test("POST /api/reviews rejects an unauthenticated caller", async () => {
+  await withIdentity(null, async () => {
+    const response = await POST(postRequest(validBody()));
     assert.equal(response.status, 401);
     assert.match((await response.json()).error, /must be signed in/);
   });
 });
 
-test("POST /api/reviews creates a review for the signed-in user", async () => {
-  const originalFetch = globalThis.fetch;
-  let requestBody: Record<string, unknown> | null = null;
-  globalThis.fetch = async (_url: RequestInfo | URL, init?: RequestInit) => {
-    requestBody = init?.body ? JSON.parse(String(init.body)) : null;
-    return jsonResponse(reviewRow({ id: "new-1" }), 201);
-  };
-  try {
-    await withUser({ id: "author-1" }, async () => {
-      const response = await POST(postRequest(JSON.stringify(validBody)));
-      assert.equal(response.status, 201);
-      assert.equal((await response.json()).review.id, "new-1");
-    });
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
-  assert.equal(requestBody!.author_id, "author-1");
-  assert.equal(requestBody!.star_rating, 4);
+test("POST /api/reviews checks authentication before reading the body", async () => {
+  // An anonymous caller should get 401 rather than "your JSON is malformed",
+  // which would otherwise leak that the body was even looked at.
+  await withIdentity(null, async () => {
+    const response = await POST(postRequest("{not valid json"));
+    assert.equal(response.status, 401);
+  });
 });
 
-test("POST /api/reviews ignores an author_id supplied by the client", async () => {
-  const originalFetch = globalThis.fetch;
-  let requestBody: Record<string, unknown> | null = null;
-  globalThis.fetch = async (_url: RequestInfo | URL, init?: RequestInit) => {
-    requestBody = init?.body ? JSON.parse(String(init.body)) : null;
-    return jsonResponse(reviewRow({ id: "new-2" }), 201);
-  };
-  try {
-    await withUser({ id: "real-author" }, async () => {
+test("POST /api/reviews accepts a signed-in caller and returns 201", async () => {
+  await withIdentity(OWNER, async () => {
+    await withFetch(
+      () => jsonResponse(row(), 201),
+      async () => {
+        const response = await POST(postRequest(validBody()));
+        assert.equal(response.status, 201);
+        assert.equal((await response.json()).review.id, "new-1");
+      },
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Ownership
+// ---------------------------------------------------------------------------
+
+test("POST /api/reviews attributes the review to the session, ignoring the body", async () => {
+  let written: Record<string, unknown> = {};
+
+  await withIdentity(OWNER, async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (_url: RequestInfo | URL, init?: RequestInit) => {
+      written = init?.body ? JSON.parse(String(init.body)) : {};
+      return jsonResponse(row(), 201);
+    };
+    try {
+      const response = await POST(postRequest(validBody()));
+      assert.equal(response.status, 201);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  assert.equal(written.user_id, OWNER, "the owner must come from the session");
+  assert.equal(written.user_name, "jamfan");
+});
+
+test("POST /api/reviews refuses a review attributed to another user", async () => {
+  await withIdentity(OWNER, async () => {
+    const response = await POST(postRequest(validBody({ user_id: OTHER })));
+    assert.equal(response.status, 400);
+    assert.match((await response.json()).error, /taken from your session/);
+  });
+});
+
+test("POST /api/reviews refuses a client-supplied display name", async () => {
+  await withIdentity(OWNER, async () => {
+    const response = await POST(postRequest(validBody({ userName: "someone else" })));
+    assert.equal(response.status, 400);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Validation
+// ---------------------------------------------------------------------------
+
+test("POST /api/reviews rejects invalid JSON from a signed-in caller", async () => {
+  await withIdentity(OWNER, async () => {
+    const response = await POST(postRequest("{not valid json"));
+    assert.equal(response.status, 400);
+    assert.match((await response.json()).error, /must be valid JSON/);
+  });
+});
+
+test("POST /api/reviews rejects a body missing required fields", async () => {
+  await withIdentity(OWNER, async () => {
+    const response = await POST(postRequest(JSON.stringify({ musician: "Nova Bloom" })));
+    assert.equal(response.status, 400);
+    const body = await response.json();
+    assert.match(body.error, /required/);
+    const fields = body.fields.map((f: { field: string }) => f.field);
+    assert.ok(fields.includes("venue"));
+    assert.ok(fields.includes("reviewText"));
+    assert.ok(fields.includes("rating"));
+    assert.ok(fields.includes("concertDate"));
+  });
+});
+
+test("POST /api/reviews rejects a future concert date", async () => {
+  await withIdentity(OWNER, async () => {
+    const tomorrow = new Date(`${TODAY}T00:00:00Z`);
+    tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
+    const response = await POST(
+      postRequest(validBody({ concertDate: tomorrow.toISOString().slice(0, 10) })),
+    );
+    assert.equal(response.status, 400);
+    assert.match((await response.json()).error, /already happened/);
+  });
+});
+
+test("POST /api/reviews accepts a concert dated today", async () => {
+  await withIdentity(OWNER, async () => {
+    await withFetch(
+      () => jsonResponse(row({ concert_date: TODAY }), 201),
+      async () => {
+        const response = await POST(postRequest(validBody({ concertDate: TODAY })));
+        assert.equal(response.status, 201);
+      },
+    );
+  });
+});
+
+test("POST /api/reviews rejects out-of-range and fractional ratings", async () => {
+  await withIdentity(OWNER, async () => {
+    for (const rating of [0, 6, 3.5]) {
+      const response = await POST(postRequest(validBody({ rating })));
+      assert.equal(response.status, 400, `rating ${rating} should be rejected`);
+      assert.match((await response.json()).error, /whole number from 1 to 5/);
+    }
+  });
+});
+
+test("POST /api/reviews accepts optional aspect ratings", async () => {
+  let written: Record<string, unknown> = {};
+
+  await withIdentity(OWNER, async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (_url: RequestInfo | URL, init?: RequestInit) => {
+      written = init?.body ? JSON.parse(String(init.body)) : {};
+      return jsonResponse(row({ rating_sound: 5 }), 201);
+    };
+    try {
       const response = await POST(
-        postRequest(JSON.stringify({ ...validBody, author_id: "spoofed", authorId: "spoofed" })),
+        postRequest(validBody({ aspectRatings: { sound: 5, venue: 3 } })),
       );
       assert.equal(response.status, 201);
-    });
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
-  assert.equal(requestBody!.author_id, "real-author");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  assert.equal(written.rating_sound, 5);
+  assert.equal(written.rating_venue, 3);
 });
 
+test("POST /api/reviews rejects an out-of-range aspect rating", async () => {
+  await withIdentity(OWNER, async () => {
+    const response = await POST(postRequest(validBody({ aspectRatings: { crowd: 9 } })));
+    assert.equal(response.status, 400);
+    assert.match((await response.json()).error, /Crowd must be a whole number/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Failure mapping
+// ---------------------------------------------------------------------------
+
 test("POST /api/reviews maps a ReviewsError to 502", async () => {
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => jsonResponse({ message: "constraint violation" }, 400);
-  try {
-    await withUser({ id: "author-1" }, async () => {
-      const response = await POST(postRequest(JSON.stringify(validBody)));
-      assert.equal(response.status, 502);
-    });
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
+  await withIdentity(OWNER, async () => {
+    await withFetch(
+      () => jsonResponse({ message: "constraint violation" }, 400),
+      async () => {
+        const response = await POST(postRequest(validBody()));
+        assert.equal(response.status, 502);
+      },
+    );
+  });
 });
 
 test("POST /api/reviews returns 500 for a non-ReviewsError", async () => {
@@ -218,8 +333,8 @@ test("POST /api/reviews returns 500 for a non-ReviewsError", async () => {
     },
   });
   try {
-    await withUser({ id: "author-1" }, async () => {
-      const response = await POST(postRequest(JSON.stringify(validBody)));
+    await withIdentity(OWNER, async () => {
+      const response = await POST(postRequest(validBody()));
       assert.equal(response.status, 500);
       assert.match((await response.json()).error, /Unexpected error while creating review/);
     });
